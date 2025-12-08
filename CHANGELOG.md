@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.4.0] - 2025-12-08
+
+### Added
+- Benchmarks of multicast broadcast operations executed by Copy Engines
+- Unicast and multicast TMA testcases
+- Heatmap plotter now has an option to skip plotting data values
+
+### Changed
+- All-to-one testcases warn if individual results are significantly assymetric
+- Column separators in gpu_to_rack testcases are only printed in "rich output mode"
+- Deprecated CUDA 12.X, support will be removed in next release
+- Deprecated 570 and 575 drivers, support will be removed in next release
+
+### Fixed
+- Row separator handling in heatmap plotter
+
 ## [1.3.0] - 2025-10-02
 
 ### Added

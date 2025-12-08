@@ -206,6 +206,12 @@ void NvLoom::doMemcpyWarmup(CopyType copyType, CUdeviceptr dst, CUdeviceptr src,
         copyKernelMulticastRed(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
     } else if (copyType == COPY_TYPE_LATENCY) {
         pointerChase(src, byteCount, WARMUP_LATENCY_ITERATIONS, 0, 0, hStream);
+    } else if (copyType == COPY_TYPE_TMA) {
+        copyKernelTma(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
+    } else if (copyType == COPY_TYPE_TMA_MULTICAST_WRITE) {
+        copyKernelMulticastTma(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
+    } else if (copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL || copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) {
+        copyKernelMulticastRedTma(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
     } else {
         ASSERT(0);
     }
@@ -235,6 +241,12 @@ unsigned long long NvLoom::doMemcpyInSpinKernel(CopyType copyType, CUdeviceptr d
             iterationsSoFar += iterations;
         }
         ASSERT(iterationsSoFar == loopCount + WARMUP_LATENCY_ITERATIONS);
+    } else if (copyType == COPY_TYPE_TMA) {
+        copyKernelTma(dst, src, byteCount, hStream, loopCount);
+    } else if (copyType == COPY_TYPE_TMA_MULTICAST_WRITE) {
+        copyKernelMulticastTma(dst, src, byteCount, hStream, loopCount);
+    } else if (copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL || copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) {
+        copyKernelMulticastRedTma(dst, src, byteCount, hStream, loopCount);
     } else {
         ASSERT(0);
     }
@@ -365,3 +377,36 @@ void NvLoom::finalize() {
 };
 
 MPIOutput OUTPUT;
+
+static int getMajorComputeCapability() {
+    int major;
+    CU_ASSERT(cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, NvLoom::getLocalDevice()));
+    return major;
+}
+
+bool filterCopyType(CopyType copyType) {
+    switch (copyType) {
+        case COPY_TYPE_CE:
+            return true;
+        case COPY_TYPE_SM:
+            return true;
+        // If we can allocate multicast buffers, we can run multicast copies
+        case COPY_TYPE_MULTICAST_WRITE:
+            return true;
+        case COPY_TYPE_MULTICAST_LD_REDUCE:
+            return true;
+        case COPY_TYPE_MULTICAST_RED_ALL:
+            return true;
+        case COPY_TYPE_MULTICAST_RED_SINGLE:
+            return true;
+        case COPY_TYPE_LATENCY:
+            return true;
+        case COPY_TYPE_TMA:
+            return getMajorComputeCapability() >= 9;
+        case COPY_TYPE_TMA_MULTICAST_WRITE:
+        case COPY_TYPE_TMA_MULTICAST_RED_ALL:
+        case COPY_TYPE_TMA_MULTICAST_RED_SINGLE:
+            return tmaMulticastSupported() && (getMajorComputeCapability() >= 9);
+    }
+    return false;
+}

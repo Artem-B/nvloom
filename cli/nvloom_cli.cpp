@@ -24,7 +24,7 @@
 #include <iostream>
 #include <memory>
 
-#define NVLOOM_VERSION "1.3.0"
+#define NVLOOM_VERSION "1.4.0"
 #ifndef GIT_COMMIT
 #define GIT_COMMIT "unknown"
 #endif
@@ -66,7 +66,7 @@ int run_program(int argc, char **argv) {
     int repeat = 1;
     int duration = -1;
 
-    std::string suitesOptionDescription("Suite(s) to run (by name): all-to-one, egm, fabric-stress, gpu-to-rack, multicast, pairwise, rack-to-rack, latency");
+    std::string suitesOptionDescription("Suite(s) to run (by name): all-to-one, egm, fabric-stress, gpu-to-rack, multicast, pairwise, rack-to-rack, latency, pairwise-tma, multicast-tma");
     opts.add_options()
         ("help,h", "Produce help message")
         ("bufferSize,b", boost::program_options::value<int>(&bufferSizeInMiB)->default_value(bufferSizeInMiB), "Buffer size in MiB")

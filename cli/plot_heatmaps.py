@@ -30,13 +30,14 @@ def get_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="plot_heatmaps.py",
                                      usage=usage_string)
     parser.add_argument("-p", "--path", default=os.getcwd())
-    parser.add_argument("-l", "--heatmap_lower_limit", default=0)
-    parser.add_argument("-u", "--heatmap_upper_limit")
-    parser.add_argument("--title_fontsize", default=32)
-    parser.add_argument("--legend_fontsize", default=24)
-    parser.add_argument("--data_fontsize_scaling_factor", default=1)
-    parser.add_argument("--plot_size", default=32)
+    parser.add_argument("-l", "--heatmap_lower_limit", default=0, type=float)
+    parser.add_argument("-u", "--heatmap_upper_limit", type=float)
+    parser.add_argument("--title_fontsize", default=32, type=float)
+    parser.add_argument("--legend_fontsize", default=24, type=float)
+    parser.add_argument("--data_fontsize_scaling_factor", default=1, type=float)
+    parser.add_argument("--plot_size", default=32, type=float)
     parser.add_argument("--file_format", default="png", choices=list(plt.gcf().canvas.get_supported_filetypes().keys()))
+    parser.add_argument("--no_heatmap_data_labels", action="store_true")
     return parser
 
 
@@ -84,7 +85,7 @@ def apply_row_separators(heatmap: plt.Axes,
         return
 
     # we only want row separators if we have as many rows as processes
-    if len(results) is not len(rack_guids):
+    if len(results) != len(rack_guids):
         return
 
     sec = heatmap.secondary_yaxis(location="right")
@@ -236,7 +237,8 @@ def plot_result(name: str,
     generate_stats_plot(stats, [min_value, avg_value, max_value], threshold, stats_fontsize)
 
     # create numerical labels for each heatmap field
-    apply_heatmap_data_labels(heatmap, results, threshold, fontsize)
+    if not ARGS.no_heatmap_data_labels:
+        apply_heatmap_data_labels(heatmap, results, threshold, fontsize)
 
     format_heatmap(heatmap, results, labels_x, labels_y, columns_separators, row_separators, rack_guids, name)
 

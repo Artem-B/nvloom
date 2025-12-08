@@ -65,11 +65,11 @@ public:
 };
 
 // Most testcases have a very simple filter, based only on source and destination allocators
-template <typename dstAllocator, typename srcAllocator>
+template <typename dstAllocator, typename srcAllocator, CopyType copyType>
 class TestcaseDstSrc : public Testcase {
 public:
     bool filter() {
-        return MPIWrapper::getWorldSize() > 1 && srcAllocator::filter() && dstAllocator::filter();
+        return MPIWrapper::getWorldSize() > 1 && srcAllocator::filter() && dstAllocator::filter() && filterCopyType(copyType);
     }
 };
 

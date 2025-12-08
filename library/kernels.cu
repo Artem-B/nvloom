@@ -21,6 +21,7 @@
 #include <curand_kernel.h>
 #include <cuda/ptx>
 #include <algorithm>
+#include <cuda_awbarrier_primitives.h>
 
 constexpr unsigned int numThreadPerBlock = 512;
 
@@ -144,8 +145,208 @@ void launchCopyKernel(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size,
     CUDA_ASSERT(cudaPeekAtLastError());
 }
 
+// TMA kernels
+#define TMA_CHUNK_SIZE_BYTES 32768
+
+#if __CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1
+#define TMA_MULTICAST_SUPPORTED 1
+#elif __CUDACC_VER_MAJOR__ > 13
+#define TMA_MULTICAST_SUPPORTED 1
+#else
+#define TMA_MULTICAST_SUPPORTED 0
+#endif
+
+template <int chunk_size_bytes>
+struct SMEM {
+  alignas(16) char buf[chunk_size_bytes];
+  alignas(16) __mbarrier_t bar;
+};
+
+#if __CUDA_ARCH__ >= 900
+inline __device__ void cp_async_bulk_global_to_shared(void *dest, void * src, __mbarrier_t *barrier, int size)
+{
+  uint32_t smem_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dest));
+  uint64_t gmem_ptr = static_cast<uint64_t>(__cvta_generic_to_global(src));
+  uint32_t smem_barrier_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+
+  asm volatile(
+    "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+    :
+    : "r"(smem_ptr),
+      "l"(gmem_ptr),
+      "r"(size),
+      "r"(smem_barrier_ptr)
+    : "memory");
+}
+
+inline __device__ __mbarrier_token_t barrier_arrive1_tx(__mbarrier_t *barrier, uint32_t expected_tx_count)
+{
+    __mbarrier_token_t token;
+
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %0, [%1], %2;"
+                 : "=l"(token)
+                 : "r"(static_cast<unsigned int>(__cvta_generic_to_shared(barrier))), "r"(expected_tx_count)
+                 : "memory");
+    return token;
+}
+
+inline __device__ bool barrier_try_wait_token(__mbarrier_t *barrier, __mbarrier_token_t token)
+{
+  // This function returns a bool, so that software can retry.
+  //
+  //  The HW only provides best-effort waiting support. The wait time is limited
+  //  by the HW capability, after which a fail occurs, in which case the SW is
+  //  responsible for retrying.
+  int __ready;
+  asm volatile("{\n\t"
+               ".reg .pred p;\n\t"
+               "mbarrier.try_wait.acquire.cta.shared::cta.b64 p, [%1], %2;\n\t"
+               "selp.b32 %0, 1, 0, p;\n\t"
+               "}"
+               : "=r"(__ready)
+               : "r"(static_cast<unsigned int>(__cvta_generic_to_shared(barrier))),
+                 "l"(token)
+               : "memory");
+  return __ready;
+}
+
+inline __device__ void cp_async_bulk_commit_group()
+{
+  asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+}
+
+inline __device__ void cp_async_bulk_wait_all_read()
+{
+  // The optional .read modifier indicates that the waiting has to be done until
+  // all the bulk async operations in the specified bulk async-group have
+  // completed reading from their source locations.
+  asm volatile("cp.async.bulk.wait_group.read 0; \n" ::: "memory");
+}
+
+inline __device__ void cp_async_bulk_wait_all()
+{
+  asm volatile("cp.async.bulk.wait_group 0; \n" ::: "memory");
+}
+#endif // __CUDA_ARCH__ >= 900
+
+using cp_async_bulk_shared_to_global_func = void (*)(void*, void*, int);
+
+inline __device__ void cp_async_bulk_shared_to_global(void *dest, void * src, int size)
+{
+#if __CUDA_ARCH__ >= 900
+  uint64_t dest_gmem_ptr = static_cast<uint64_t>(__cvta_generic_to_global(dest));
+  uint32_t src_smem_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+
+  asm volatile(
+    "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;\n"
+    :
+    : "l"(dest_gmem_ptr),
+      "r"(src_smem_ptr),
+      "r"(size)
+    : "memory");
+#endif
+}
+
+inline __device__ void cp_async_bulk_shared_to_global_multicast(void *dest, void * src, int size)
+{
+#if __CUDA_ARCH__ >= 900
+#if TMA_MULTICAST_SUPPORTED
+  uint64_t dest_gmem_ptr = static_cast<uint64_t>(__cvta_generic_to_global(dest));
+  uint32_t src_smem_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+
+  asm volatile(
+    "multimem.cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;\n"
+    :
+    : "l"(dest_gmem_ptr),
+      "r"(src_smem_ptr),
+      "r"(size)
+    : "memory");
+#endif
+#endif
+}
+
+inline __device__ void cp_async_bulk_shared_to_global_multicast_red(void *dest, void * src, int size)
+{
+#if __CUDA_ARCH__ >= 900
+#if TMA_MULTICAST_SUPPORTED
+  uint64_t dest_gmem_ptr = static_cast<uint64_t>(__cvta_generic_to_global(dest));
+  uint32_t src_smem_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+
+  asm volatile(
+    "multimem.cp.reduce.async.bulk.global.shared::cta.bulk_group.add.u32 [%0], [%1], %2;\n"
+    :
+    : "l"(dest_gmem_ptr),
+      "r"(src_smem_ptr),
+      "r"(size)
+    : "memory");
+#endif
+#endif
+}
+
+template<size_t bytesChunk, cp_async_bulk_shared_to_global_func write>
+__global__ void memcpyKernelTma(unsigned long long loopCount, char* dst, char* src, size_t size) {
+#if __CUDA_ARCH__ >= 900
+    assert(size % TMA_CHUNK_SIZE_BYTES == 0 && "TMA memcpy kernels require copy size to be a multiple of TMA_CHUNK_SIZE_BYTES");
+    extern __shared__ char smem_bytes[];
+    using SMEM_T = SMEM<bytesChunk>;
+    SMEM_T &smem = reinterpret_cast<SMEM_T&>(smem_bytes);
+    __mbarrier_init(&smem.bar, 1);
+
+    assert(blockDim.x == 1 && "There is zero reason to run this kernel with more than 1 thread / block.");
+
+    size_t block_stride = size_t(bytesChunk) * size_t(blockIdx.x);
+    size_t grid_stride = size_t(gridDim.x) * size_t(bytesChunk);
+    for (unsigned long long loop = 0; loop < loopCount; loop++) {
+        for (size_t i = block_stride; i < size; i += grid_stride) {
+            size_t bytesToCopy = bytesChunk;
+            if (i + bytesToCopy > size) {
+                bytesToCopy = size - i;
+            }
+
+            cp_async_bulk_global_to_shared(&smem.buf[0], src + i, &smem.bar, bytesToCopy);
+            __mbarrier_token_t token = barrier_arrive1_tx(&smem.bar, bytesToCopy);
+
+            // Wait for previous transfer. Retry in case of false. (waiting can fail)
+            while (!barrier_try_wait_token(&smem.bar, token)) {}
+            // Data in smem_buf is ready.
+
+            // Write it out to peer global memory
+            write(dst + i, &smem.buf[0], bytesToCopy);
+
+            // Commits previously issued TMA instruction from POV of this thread. Read to SMEM have not yet completed.
+            cp_async_bulk_commit_group();
+
+            // This guarantees that all of the SMEM read requests have completed, even if the actual dest might be in flight
+            cp_async_bulk_wait_all_read(); // NOTE: .read modifier
+        }
+    }
+
+    __threadfence_system();
+#endif
+}
+
+template<cp_async_bulk_shared_to_global_func write>
+void launchCopyKernelTma(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
+    dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
+    dim3 blockDim(1, 1, 1);
+    memcpyKernelTma<TMA_CHUNK_SIZE_BYTES, write> <<<gridDim, blockDim, sizeof(SMEM<TMA_CHUNK_SIZE_BYTES>), stream>>> (loopCount, (char *) dstBuffer, (char *) srcBuffer, size);
+    CUDA_ASSERT(cudaPeekAtLastError());
+}
+
 void copyKernel(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
     launchCopyKernel<uint4, stridingMemcpyKernel<uint4, write_to_regular_memory> >(dstBuffer, srcBuffer, size, stream, loopCount);
+}
+
+void copyKernelTma(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
+    launchCopyKernelTma<cp_async_bulk_shared_to_global>(dstBuffer, srcBuffer, size, stream, loopCount);
+}
+
+void copyKernelMulticastTma(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
+    launchCopyKernelTma<cp_async_bulk_shared_to_global_multicast>(dstBuffer, srcBuffer, size, stream, loopCount);
+}
+
+void copyKernelMulticastRedTma(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
+    launchCopyKernelTma<cp_async_bulk_shared_to_global_multicast_red>(dstBuffer, srcBuffer, size, stream, loopCount);
 }
 
 void copyKernelMulticast(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
@@ -234,13 +435,13 @@ void zeroOutBuffer(void *ptr, size_t size, CUstream stream) {
 void memsetBuffer(void *ptr, int seed, size_t size, CUstream stream, CopyType copyType, MemoryPurpose memoryPurpose) {
     if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) {
         memsetBuffer(ptr, seed, size, stream, MPIWrapper::getWorldRank(), MPIWrapper::getWorldSize());
-    } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL) {
+    } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL) {
         if (memoryPurpose == MemoryPurpose::MEMORY_SOURCE) {
             memsetBuffer(ptr, seed, size, stream, MPIWrapper::getWorldRank(), MPIWrapper::getWorldSize());
         } else {
             zeroOutBuffer(ptr, size, stream);
         }
-    } else if (copyType == COPY_TYPE_MULTICAST_RED_SINGLE) {
+    } else if (copyType == COPY_TYPE_MULTICAST_RED_SINGLE || copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) {
         if (memoryPurpose == MemoryPurpose::MEMORY_SOURCE) {
             memsetBuffer(ptr, seed, size, stream, 0, 1);
         } else {
@@ -306,9 +507,9 @@ unsigned long long checkBuffer(void *ptr, int seed, size_t size, CUstream stream
 unsigned long long checkBuffer(void *ptr, int seed, size_t size, CUstream stream, CopyType copyType, int iterations) {
     if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) {
         return checkBuffer(ptr, seed, size, stream, MPIWrapper::getWorldSize(), 1);
-    } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL) {
+    } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL) {
         return checkBuffer(ptr, seed, size, stream, MPIWrapper::getWorldSize(), iterations);
-    } else if (copyType == COPY_TYPE_MULTICAST_RED_SINGLE) {
+    } else if (copyType == COPY_TYPE_MULTICAST_RED_SINGLE || copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) {
         return checkBuffer(ptr, seed, size, stream, 1, iterations);
     } else if (copyType == COPY_TYPE_LATENCY) {
         // Latency measurement is read-only, so there's nothing to verify
@@ -373,7 +574,7 @@ std::vector<int> getSmIds() {
     CU_ASSERT(cuMemAlloc((CUdeviceptr *) &smIdsDevice, sizeof(int) * smCount));
     CU_ASSERT(cuMemsetD8((CUdeviceptr) smIdsDevice, 0, sizeof(int) * smCount));
 
-    dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
+    dim3 gridDim(smCount, 1, 1);
     dim3 blockDim(1, 1, 1);
     getSmIdsKernel<<<gridDim, blockDim>>>(smIdsDevice);
     CUDA_ASSERT(cudaPeekAtLastError());
@@ -400,9 +601,16 @@ void preloadKernels(int localDevice) {
     cudaFuncGetAttributes(&unused, &patternFillKernel);
     cudaFuncGetAttributes(&unused, &patternCheckKernel);
     cudaFuncGetAttributes(&unused, &getSmIdsKernel);
+    cudaFuncGetAttributes(&unused, &memcpyKernelTma<TMA_CHUNK_SIZE_BYTES, cp_async_bulk_shared_to_global>);
+    cudaFuncGetAttributes(&unused, &memcpyKernelTma<TMA_CHUNK_SIZE_BYTES, cp_async_bulk_shared_to_global_multicast>);
+    cudaFuncGetAttributes(&unused, &memcpyKernelTma<TMA_CHUNK_SIZE_BYTES, cp_async_bulk_shared_to_global_multicast_red>);
 }
 
 // This utility function has to be defined in a .cu file because it uses nvcc compiler macros
 std::string getNvccVersion() {
     return std::to_string(__CUDACC_VER_MAJOR__) + "." + std::to_string(__CUDACC_VER_MINOR__);
+}
+
+bool tmaMulticastSupported() {
+    return TMA_MULTICAST_SUPPORTED;
 }

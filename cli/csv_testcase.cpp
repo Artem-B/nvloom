@@ -148,7 +148,9 @@ std::pair<int, CopyDescription> csv_pattern<unicastAllocator, egmAllocator, mult
 
     if (type == COPY_TYPE_MULTICAST_RED_ALL ||
         type == COPY_TYPE_MULTICAST_RED_SINGLE ||
-        type == COPY_TYPE_MULTICAST_LD_REDUCE) {
+        type == COPY_TYPE_MULTICAST_LD_REDUCE ||
+        type == COPY_TYPE_TMA_MULTICAST_RED_ALL ||
+        type == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) {
         throw std::runtime_error("Multicast reductions are not supported for CSV input testcase");
     }
 

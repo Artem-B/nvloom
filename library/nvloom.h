@@ -177,4 +177,6 @@ public:
 std::string getRackGuid(int device);
 std::string trimRackGuid(std::string rackGuid);
 
+bool filterCopyType(CopyType copyType);
+
 #endif

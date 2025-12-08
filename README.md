@@ -16,6 +16,12 @@ Mininium requirements:
 - Cmake 3.20
 - Boost.program_options 1.74
 
+Note: support for CUDA 12.8 and 570 driver is deprecated and will be removed in the next release.
+
+Recommended:
+- CUDA 13.0 or higher
+- 580 driver or higher
+
 There are two ways to integrate the library into an application
 
 ### .so file
@@ -272,6 +278,13 @@ Controlled with `--plot_size` option.
 Controls the output image file format. The default setting is `png`, but you might want to use other format, e.g. vector files.
 
 Available output formats might vary from system to system, as they depend on installed matplotlib backend. `plot_heatmaps.py` allows you to save your heatmaps in any format supported by the installed matplotlib, however only `png`, `svg` and `pdf` have been tested.
+
+## --no_heatmap_data_labels
+Controls whether the heatmap data values are displayed directly on top of each cell in the plot. By default, `plot_heatmaps.py` will render the numeric data value inside each cell of the heatmap for easier visual inspection. However, in certain scenarios, you may want to disable these labels for clarity.
+
+Enable this option to hide data labels from the heatmap plot.
+
+Controlled with `--no_heatmap_data_labels` flag (boolean, default: False).
 
 # Testcase reference
 

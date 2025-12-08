@@ -65,6 +65,10 @@ std::string getCopyTypeName(CopyType copyType) {
     if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) return "mc_ld_reduce";
     if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_MULTICAST_RED_SINGLE) return "mc_red";
     if (copyType == COPY_TYPE_LATENCY) return "latency";
+    if (copyType == COPY_TYPE_TMA) return "tma";
+    if (copyType == COPY_TYPE_TMA_MULTICAST_WRITE) return "tma_mc";
+    if (copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL) return "tma_mc_red_all";
+    if (copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) return "tma_mc_red_single";
     throw std::runtime_error("Invalid copy type");
 }
 
@@ -75,6 +79,10 @@ CopyType getCopyType(std::string name) {
     if (name == "mc_ld_reduce") return COPY_TYPE_MULTICAST_LD_REDUCE;
     if (name == "mc_red") return COPY_TYPE_MULTICAST_RED_ALL;
     if (name == "latency") return COPY_TYPE_LATENCY;
+    if (name == "tma") return COPY_TYPE_TMA;
+    if (name == "tma_mc") return COPY_TYPE_TMA_MULTICAST_WRITE;
+    if (name == "tma_mc_red_all") return COPY_TYPE_TMA_MULTICAST_RED_ALL;
+    if (name == "tma_mc_red_single") return COPY_TYPE_TMA_MULTICAST_RED_SINGLE;
     throw std::runtime_error("Invalid copy type");
 }
 
@@ -112,7 +120,7 @@ double doUnidirBidirHelper(int i, int j, size_t copySize) {
 }
 
 template <typename dstAllocator, typename srcAllocator, CopyDirection copyDirection, CopyType copyType, CopyCount copyCount>
-class N_squared_pattern : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+class N_squared_pattern : public TestcaseDstSrc<dstAllocator, srcAllocator, copyType> {
 public:
     void run(size_t copySize) {
         OutputMatrix output(getName(), MPIWrapper::getWorldSize(), MPIWrapper::getWorldSize());
@@ -136,7 +144,7 @@ public:
 };
 
 template <typename dstAllocator, typename srcAllocator, CopyDirection copyDirection, CopyType copyType>
-class N_squared_pattern_bidir : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+class N_squared_pattern_bidir : public TestcaseDstSrc<dstAllocator, srcAllocator, copyType> {
 public:
     void run(size_t copySize) {
         OutputMatrix output(getName(), MPIWrapper::getWorldSize(), MPIWrapper::getWorldSize());
@@ -161,7 +169,7 @@ public:
 };
 
 template <typename dstAllocator, typename srcAllocator, CopyDirection copyDirection, CopyType copyType>
-class bisect_pattern : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+class bisect_pattern : public TestcaseDstSrc<dstAllocator, srcAllocator, copyType> {
 public:
     void run(size_t copySize) {
         std::vector<std::string> rowLabels;
@@ -191,8 +199,19 @@ public:
     }
 };
 
+void checkResultSymmetry(std::vector<double> &results) {
+    ASSERT(results.size() > 0);
+    auto max = *std::max_element(results.begin(), results.end());
+    auto min = *std::min_element(results.begin(), results.end());
+    ASSERT(max > 0);
+    if ((max - min) / max > 0.05) {
+        OUTPUT << "Individual copies have significant variation, the results may be unreliable" << std::endl;
+        OUTPUT << "Min: " << min << ", Max: " << max << std::endl;
+    }
+}
+
 template <typename dstAllocator, typename srcAllocator, CopyType copyType>
-class all_to_one_pattern : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+class all_to_one_pattern : public TestcaseDstSrc<dstAllocator, srcAllocator, copyType> {
 public:
     void run(size_t copySize) {
         OutputMatrix output(getName(), 1, MPIWrapper::getWorldSize());
@@ -209,6 +228,8 @@ public:
 
             auto results = NvLoom::doBenchmark(copies);
 
+            checkResultSymmetry(results);
+
             output.set(0, targetDevice, std::reduce(results.begin(), results.end()));
         }
     }
@@ -219,7 +240,7 @@ public:
 };
 
 template <typename dstAllocator, typename srcAllocator, CopyType copyType>
-class all_from_one_pattern : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+class all_from_one_pattern : public TestcaseDstSrc<dstAllocator, srcAllocator, copyType> {
 public:
     void run(size_t copySize) {
         OutputMatrix output(getName(), 1, MPIWrapper::getWorldSize());
@@ -236,6 +257,8 @@ public:
 
             auto results = NvLoom::doBenchmark(copies);
 
+            checkResultSymmetry(results);
+
             output.set(0, targetDevice, std::reduce(results.begin(), results.end()));
         }
     }
@@ -245,9 +268,19 @@ public:
     }
 };
 
+// Multicast CE copy is only supported with CUDA 13.1+
+static bool multicastCEFilter(CopyType copyType) {
+    if (copyType != COPY_TYPE_CE) {
+        return true;
+    }
+
+    int driverVersion = 0;
+    CU_ASSERT(cuDriverGetVersion(&driverVersion));
+    return driverVersion >= 13010;
+}
 
 template <typename dstAllocator, typename srcAllocator, CopyType copyType, CopyDirection copyDirection>
-class multicast_one_to_all : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+class multicast_one_to_all : public TestcaseDstSrc<dstAllocator, srcAllocator, copyType> {
 public:
     void run(size_t copySize) {
         OutputMatrix output(getName(), 1, MPIWrapper::getWorldSize(), BUFFERING_DISABLED);
@@ -270,10 +303,14 @@ public:
         }
         return "multicast_" + direction + "_" + getCopyTypeName(copyType);
     }
+
+    bool filter() {
+        return multicastCEFilter(copyType) && (MPIWrapper::getWorldSize() > 1) && srcAllocator::filter() && dstAllocator::filter() && filterCopyType(copyType);
+    }
 };
 
 template <typename dstAllocator, typename srcAllocator, CopyType copyType>
-class multicast_all_to_all : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+class multicast_all_to_all : public TestcaseDstSrc<dstAllocator, srcAllocator, copyType> {
 public:
     void run(size_t copySize) {
         std::vector<Copy> copies;
@@ -295,10 +332,14 @@ public:
     std::string getName() {
         return "multicast_all_to_all_" + getCopyTypeName(copyType);
     }
+
+    bool filter() {
+        return multicastCEFilter(copyType) && (MPIWrapper::getWorldSize() > 1) && srcAllocator::filter() && dstAllocator::filter() && filterCopyType(copyType);
+    }
 };
 
 template <typename dstAllocator, typename srcAllocator>
-class multicast_all_to_all_ld_reduce : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+class multicast_all_to_all_ld_reduce : public TestcaseDstSrc<dstAllocator, srcAllocator, COPY_TYPE_MULTICAST_LD_REDUCE> {
 public:
     void run(size_t copySize) {
         std::vector<Copy> copies;
@@ -321,8 +362,8 @@ public:
     }
 };
 
-template <typename dstAllocator, typename srcAllocator>
-class multicast_all_to_all_red : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+template <typename dstAllocator, typename srcAllocator, CopyType copyType>
+class multicast_all_to_all_red : public TestcaseDstSrc<dstAllocator, srcAllocator, copyType> {
 public:
     void run(size_t copySize) {
         OutputMatrix output(getName(), 1, 1, BUFFERING_DISABLED);
@@ -332,7 +373,7 @@ public:
 
         for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
             std::shared_ptr<srcAllocator> src = std::make_shared<srcAllocator>(copySize, i);
-            Copy copy(dst, src, COPY_DIRECTION_WRITE, COPY_TYPE_MULTICAST_RED_ALL, iterations);
+            Copy copy(dst, src, COPY_DIRECTION_WRITE, copyType, iterations);
             copies.push_back(copy);
 
             // For the multicast_all_to_all_red testcase, we need to make sure that all source have the same uniqueId
@@ -346,7 +387,7 @@ public:
     }
 
     std::string getName() {
-        return "multicast_all_to_all_" + getCopyTypeName(COPY_TYPE_MULTICAST_RED_ALL);
+        return "multicast_all_to_all_" + getCopyTypeName(copyType);
     }
 };
 
@@ -402,7 +443,7 @@ std::mt19937 init_rng() {
 }
 
 template <typename dstAllocator, typename srcAllocator, CopyDirection copyDirection, CopyType copyType, CopyCount copyCount>
-class gpu_to_rack : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+class gpu_to_rack : public TestcaseDstSrc<dstAllocator, srcAllocator, copyType> {
 public:
     void run(size_t copySize) {
         std::mt19937 rng = init_rng();
@@ -427,11 +468,13 @@ public:
 
         output.setLabelsX(columnLabels);
 
-        std::vector<int> columnSeparators;
-        for (int i = 0; i < NvLoom::getRackToProcessMap().size() - 1; i++) {
-            columnSeparators.push_back((i + 1) * gpuToRackSamples - 1);
+        if (richOutput) {
+            std::vector<int> columnSeparators;
+            for (int i = 0; i < NvLoom::getRackToProcessMap().size() - 1; i++) {
+                columnSeparators.push_back((i + 1) * gpuToRackSamples - 1);
+            }
+            output.setColumnSeparators(columnSeparators);
         }
-        output.setColumnSeparators(columnSeparators);
 
         for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
             int j = 0;
@@ -467,7 +510,7 @@ public:
 };
 
 template <typename dstAllocator, typename srcAllocator, CopyDirection copyDirection, CopyType copyType>
-class rack_to_rack_unidir : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+class rack_to_rack_unidir : public TestcaseDstSrc<dstAllocator, srcAllocator, copyType> {
 public:
     void run(size_t copySize) {
         OutputMatrix output(getName(), NvLoom::getRackToProcessMap().size(), NvLoom::getRackToProcessMap().size());
@@ -509,7 +552,7 @@ public:
 };
 
 template <typename dstAllocator, typename srcAllocator, CopyDirection copyDirection, CopyType copyType>
-class rack_to_rack_bidir : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+class rack_to_rack_bidir : public TestcaseDstSrc<dstAllocator, srcAllocator, copyType> {
 public:
     void run(size_t copySize) {
         OutputMatrix output(getName(), NvLoom::getRackToProcessMap().size(), NvLoom::getRackToProcessMap().size());
@@ -615,6 +658,12 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "pairwise", testcases, std::make_unique<N_squared_pattern_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_SM> >());
     addTestcase(suites, "pairwise", testcases, std::make_unique<N_squared_pattern_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM> >());
 
+    // pairwise TMA
+    addTestcase(suites, "pairwise-tma", testcases, std::make_unique<N_squared_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_TMA, COPY_COUNT_UNIDIR> >());
+    addTestcase(suites, "pairwise-tma", testcases, std::make_unique<N_squared_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_TMA, COPY_COUNT_UNIDIR> >());
+    addTestcase(suites, "pairwise-tma", testcases, std::make_unique<N_squared_pattern_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_TMA> >());
+    addTestcase(suites, "pairwise-tma", testcases, std::make_unique<N_squared_pattern_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_TMA> >());
+
     // fabric-stress
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE> >());
@@ -631,11 +680,21 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "multicast", testcases, std::make_unique<multicast_one_to_all<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_MULTICAST_WRITE, COPY_DIRECTION_WRITE> >());
     addTestcase(suites, "multicast", testcases, std::make_unique<multicast_all_to_all<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_MULTICAST_WRITE> >());
 
+    addTestcase(suites, "multicast", testcases, std::make_unique<multicast_one_to_all<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_CE, COPY_DIRECTION_WRITE> >());
+    addTestcase(suites, "multicast", testcases, std::make_unique<multicast_all_to_all<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_CE> >());
+
     addTestcase(suites, "multicast", testcases, std::make_unique<multicast_one_to_all<DeviceMemoryAllocation, multicastAllocator, COPY_TYPE_MULTICAST_LD_REDUCE, COPY_DIRECTION_READ> >());
     addTestcase(suites, "multicast", testcases, std::make_unique<multicast_all_to_all_ld_reduce<DeviceMemoryAllocation, multicastAllocator> >());
 
     addTestcase(suites, "multicast", testcases, std::make_unique<multicast_one_to_all<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_MULTICAST_RED_SINGLE, COPY_DIRECTION_WRITE> >());
-    addTestcase(suites, "multicast", testcases, std::make_unique<multicast_all_to_all_red<multicastAllocator, DeviceMemoryAllocation> >());
+    addTestcase(suites, "multicast", testcases, std::make_unique<multicast_all_to_all_red<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_MULTICAST_RED_ALL> >());
+
+    // multicast TMA
+    addTestcase(suites, "multicast-tma", testcases, std::make_unique<multicast_one_to_all<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_TMA_MULTICAST_WRITE, COPY_DIRECTION_WRITE> >());
+    addTestcase(suites, "multicast-tma", testcases, std::make_unique<multicast_all_to_all<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_TMA_MULTICAST_WRITE> >());
+
+    addTestcase(suites, "multicast-tma", testcases, std::make_unique<multicast_one_to_all<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_TMA_MULTICAST_RED_SINGLE, COPY_DIRECTION_WRITE> >());
+    addTestcase(suites, "multicast-tma", testcases, std::make_unique<multicast_all_to_all_red<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_TMA_MULTICAST_RED_ALL> >());
 
     // egm
     addTestcase(suites, "egm", testcases, std::make_unique<N_squared_pattern<egmAllocator, egmAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE, COPY_COUNT_UNIDIR> >());
