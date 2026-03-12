@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.1] - 2026-03-12
+
+### Fixed
+- Fixed a bug where CSV testcase would ignore specified number of iterations
+- Fixed a bug where nvloom_cli could hang when using "duration" option to repeat testcases
+
 ## [1.4.0] - 2025-12-08
 
 ### Added

@@ -72,7 +72,7 @@ Copy getCopy(CopyDescription desc) {
     } else {
         std::shared_ptr<MemoryAllocation> srcAlloc = getAllocation<unicastAllocator, egmAllocator, multicastAllocator>(desc.src);
         std::shared_ptr<MemoryAllocation> dstAlloc = getAllocation<unicastAllocator, egmAllocator, multicastAllocator>(desc.dst);
-        return Copy(dstAlloc, srcAlloc, desc.direction, desc.type);
+        return Copy(dstAlloc, srcAlloc, desc.direction, desc.type, desc.iterationCount);
     }
 }
 

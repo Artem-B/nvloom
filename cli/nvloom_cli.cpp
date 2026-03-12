@@ -24,7 +24,7 @@
 #include <iostream>
 #include <memory>
 
-#define NVLOOM_VERSION "1.4.0"
+#define NVLOOM_VERSION "1.4.1"
 #ifndef GIT_COMMIT
 #define GIT_COMMIT "unknown"
 #endif
@@ -49,7 +49,9 @@ bool shouldContinue(boost::program_options::variables_map &vm, int iteration, st
 
     if (!vm["duration"].defaulted()) {
         auto duration = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - startTime).count();
-        return duration < vm["duration"].as<int>();
+        int shouldContinue = (duration < vm["duration"].as<int>()) ? 1 : 0;
+        MPI_Bcast(&shouldContinue, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        return shouldContinue;
     }
 
     ASSERT(0);
