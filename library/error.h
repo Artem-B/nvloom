@@ -38,26 +38,19 @@
 
 static std::vector<std::string> getCudaLogs() {
     std::vector<std::string> messages;
-#if CUDA_VERSION >= 12090
     size_t messageSize = 25601;
     std::string messagesRaw;
     messagesRaw.resize(messageSize);
 
-    CUresult (*cuLogsDumpToMemory_ptr)(CUlogIterator*, char*, size_t*, unsigned int);
-    CUdriverProcAddressQueryResult result;
-    BASIC_CU_ASSERT(cuGetProcAddress("cuLogsDumpToMemory", (void **) &cuLogsDumpToMemory_ptr, 12090, CU_GET_PROC_ADDRESS_DEFAULT, &result));
+    BASIC_CU_ASSERT(cuLogsDumpToMemory(NULL, messagesRaw.data(), &messageSize, 0));
+    messagesRaw.resize(messageSize);
 
-    if (result == CU_GET_PROC_ADDRESS_SUCCESS) {
-        BASIC_CU_ASSERT((*cuLogsDumpToMemory_ptr)(NULL, messagesRaw.data(), &messageSize, 0));
-        messagesRaw.resize(messageSize);
-        std::istringstream messagesStringstream(messagesRaw);
-        std::string message;
-
-        while(std::getline(messagesStringstream, message, '\n')) {
-            messages.push_back(message);
-        }
+    std::istringstream messagesStringstream(messagesRaw);
+    std::string message;
+    while(std::getline(messagesStringstream, message, '\n')) {
+        messages.push_back(message);
     }
-#endif
+
     return messages;
 }
 
@@ -65,6 +58,10 @@ static std::vector<std::string> getCudaLogs() {
 
 #define ASSERT(x) do { \
     if (!(x)) { \
+        if (NvLoom::executingCopies()) { \
+            std::cerr << "[" << NvLoom::getLocalHostname() << ":" << NvLoom::getLocalDevice() << "]: " << "Currently executing copies:" << std::endl; \
+            for (auto copy : NvLoom::dumpCurrentCopies()) {std::cerr << "[" << NvLoom::getLocalHostname() << ":" << NvLoom::getLocalDevice() << "]: " << copy << std::endl;}; \
+        } \
         std::cerr << "[" << NvLoom::getLocalHostname() << ":" << NvLoom::getLocalDevice() << "]: " << "ASSERT in expression " << #x << " in " << __PRETTY_FUNCTION__ << "() : " << __FILE__ << ":" <<  __LINE__  << std::endl; \
         std::exit(1); \
     }  \
@@ -77,6 +74,10 @@ static std::vector<std::string> getCudaLogs() {
         cuGetErrorString(cuResult, &errDescStr); \
         cuGetErrorName(cuResult, &errNameStr); \
         for (auto message : getCudaLogs()) {std::cerr << "[" << NvLoom::getLocalHostname() << ":" << NvLoom::getLocalDevice() << "]: " << message << std::endl;}; \
+        if (NvLoom::executingCopies()) { \
+            std::cerr << "[" << NvLoom::getLocalHostname() << ":" << NvLoom::getLocalDevice() << "]: " << "Currently executing copies:" << std::endl; \
+            for (auto copy : NvLoom::dumpCurrentCopies()) {std::cerr << "[" << NvLoom::getLocalHostname() << ":" << NvLoom::getLocalDevice() << "]: " << copy << std::endl;}; \
+        } \
         std::cerr << "[" << NvLoom::getLocalHostname() << ":" << NvLoom::getLocalDevice() << "]: " << "[" << errNameStr << "] " << errDescStr << " in expression " << #x << " in " << __PRETTY_FUNCTION__ << "() : " << __FILE__ << ":" <<  __LINE__ << std::endl; \
         std::exit(1); \
     }  \
@@ -86,6 +87,10 @@ static std::vector<std::string> getCudaLogs() {
     cudaError_t cudaErr = (x); \
     if ((cudaErr) != cudaSuccess) { \
         for (auto message : getCudaLogs()) {std::cerr << "[" << NvLoom::getLocalHostname() << ":" << NvLoom::getLocalDevice() << "]: " << message << std::endl;}; \
+        if (NvLoom::executingCopies()) { \
+            std::cerr << "[" << NvLoom::getLocalHostname() << ":" << NvLoom::getLocalDevice() << "]: " << "Currently executing copies:" << std::endl; \
+            for (auto copy : NvLoom::dumpCurrentCopies()) {std::cerr << "[" << NvLoom::getLocalHostname() << ":" << NvLoom::getLocalDevice() << "]: " << copy << std::endl;}; \
+        } \
         std::cerr << "[" << NvLoom::getLocalHostname() << ":" << NvLoom::getLocalDevice() << "]: " << "[" << cudaGetErrorName(cudaErr) << "] " << cudaGetErrorString(cudaErr) << " in expression " << #x << " in " << __PRETTY_FUNCTION__ << "() : " << __FILE__ << ":" <<  __LINE__ << std::endl; \
         std::exit(1); \
     }  \
@@ -94,6 +99,10 @@ static std::vector<std::string> getCudaLogs() {
 #define NVML_ASSERT(x) do { \
     nvmlReturn_t nvmlResult = (x); \
     if ((nvmlResult) != NVML_SUCCESS) { \
+        if (NvLoom::executingCopies()) { \
+            std::cerr << "[" << NvLoom::getLocalHostname() << ":" << NvLoom::getLocalDevice() << "]: " << "Currently executing copies:" << std::endl; \
+            for (auto copy : NvLoom::dumpCurrentCopies()) {std::cerr << "[" << NvLoom::getLocalHostname() << ":" << NvLoom::getLocalDevice() << "]: " << copy << std::endl;}; \
+        } \
         std::cerr << "[" << NvLoom::getLocalHostname() << ":" << NvLoom::getLocalDevice() << "]: " << "[" << nvmlErrorString(nvmlResult) << "] in expression " << #x << " in " << __PRETTY_FUNCTION__ << "() : " << __FILE__ << ":" <<  __LINE__ << std::endl; \
         std::exit(1); \
     }  \

@@ -106,15 +106,6 @@ int csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::getInt(std:
 }
 
 template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
-size_t csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::getSizeT(std::string str, std::string field) {
-    try {
-        return std::stoul(str);
-    } catch (const std::invalid_argument& e) {
-        throw std::runtime_error("Invalid " + field + ": " + str);
-    }
-}
-
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
 std::pair<int, CopyDescription> csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::parseCSVLine(const std::string& line) {
     std::istringstream ss(line);
 
@@ -285,4 +276,4 @@ void csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::writeCsvTo
 
 template class csv_pattern<MultinodeMemoryAllocationUnicast, MultinodeMemoryAllocationEGM, MultinodeMemoryAllocationMulticast>;
 template class csv_pattern<AllocationPool<MultinodeMemoryAllocationUnicast>, AllocationPool<MultinodeMemoryAllocationEGM>, MulticastPool>;
-template class csv_pattern<MultinodeMemoryPoolAllocationUnicast, MultinodeMemoryPoolAllocationEGM, MultinodeMemoryAllocationMulticast>;
+template class csv_pattern<MultinodeMemoryPoolAllocationUnicast, MultinodeMemoryPoolAllocationEGM, MultinodeMemoryAllocationMulticastCudaPool>;

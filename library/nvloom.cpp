@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <iostream>
 #include <iomanip>
 #include <string.h>
@@ -27,7 +28,26 @@
 #define NVML_NO_UNVERSIONED_FUNC_DEFS
 #include <nvml.h>
 
-auto getCopiesWithUniqueSources(std::vector<Copy> copies) {
+Copy::Copy(std::shared_ptr<MemoryAllocation> _dst, std::shared_ptr<MemoryAllocation> _src, CopyDirection _copyDirection, CopyType _copyType, int _iterations) :
+    dst(_dst),
+    src(_src),
+    copyDirection(_copyDirection),
+    copyType(_copyType),
+    iterations(_iterations) {
+
+    if (copyDirection == COPY_DIRECTION_READ) {
+        executingMPIrank = dst->MPIrank;
+    } else {
+        executingMPIrank = src->MPIrank;
+    }
+
+    counter = std::make_shared<AllocationPool<HostMemoryAllocation>>(sizeof(int), executingMPIrank);
+    if (executingMPIrank == MPIWrapper::getWorldRank()) {
+        *(int *) counter->ptr = (int) BenchmarkState::NOT_STARTED;
+    }
+}
+
+static auto getCopiesWithUniqueSources(std::vector<Copy> copies) {
     auto comp = [](Copy a, Copy b) {return a.src.get() < b.src.get();};
     std::set<Copy, decltype(comp) > uniqueSources(comp);
     for (auto &copy : copies) {
@@ -36,7 +56,7 @@ auto getCopiesWithUniqueSources(std::vector<Copy> copies) {
     return uniqueSources;
 }
 
-auto getCopiesWithUniqueDestinations(std::vector<Copy> copies) {
+static auto getCopiesWithUniqueDestinations(std::vector<Copy> copies) {
     auto comp = [](Copy a, Copy b) {return a.dst.get() < b.dst.get();};
     std::set<Copy, decltype(comp) > uniqueDestinations(comp);
     for (auto &copy : copies) {
@@ -45,115 +65,160 @@ auto getCopiesWithUniqueDestinations(std::vector<Copy> copies) {
     return uniqueDestinations;
 }
 
-std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
-    if (copies.size() == 0) {return {};};
-
-    std::vector<double> results;
-
-    std::vector<Copy> filteredCopies;
-    for (auto copy : copies) {
-        if (MPIWrapper::getWorldRank() == copy.executingMPIrank) {
-            filteredCopies.push_back(copy);
-        }
+static bool isEventDone(CUevent event) {
+    CUresult result = cuEventQuery(event);
+    if (result == CUDA_SUCCESS) {
+        return true;
+    } else if (result == CUDA_ERROR_NOT_READY) {
+        return false;
     }
+    CU_ASSERT(result);
+    return false;
+}
 
-    std::vector<CUstream> filteredStreams(filteredCopies.size());
-    std::vector<CUevent> filteredStartEvents(filteredCopies.size());
-    std::vector<CUevent> filteredEndEvents(filteredCopies.size());
-    std::vector<double> filteredBandwidths(filteredCopies.size());
-    std::vector<int> filteredExecutedIterations(filteredCopies.size());
+Benchmark::Benchmark(std::vector<Copy> _copies) : copies(_copies) {
+    filteredCopies = getFilteredCopies();
+    filteredStreams.resize(filteredCopies.size());
+    filteredStartEvents.resize(filteredCopies.size());
+    filteredEndEvents.resize(filteredCopies.size());
+    filteredLoadSustainmentEvents.resize(filteredCopies.size());
+    filteredExecutedIterations.resize(filteredCopies.size());
 
-    AllocationPool<HostMemoryAllocation> blockingVarHost(sizeof(int), copies[0].executingMPIrank);
-    AllocationPool<MultinodeMemoryAllocationUnicast> blockingVarDevice(sizeof(int), copies[0].executingMPIrank);
+    NvLoom::setCurrentCopies(filteredCopies);
 
-    // init
-    if (MPIWrapper::getWorldRank() == copies[0].executingMPIrank) {
-        *((int *) (blockingVarHost.ptr)) = 0;
-        CU_ASSERT(cuMemsetD32((CUdeviceptr) blockingVarDevice.ptr, 0, 1));
-    }
+    blockingVarHost = std::make_shared<AllocationPool<HostMemoryAllocation>>(sizeof(int), copies[0].executingMPIrank);
+    blockingVarDevice = std::make_shared<AllocationPool<MultinodeMemoryAllocationUnicast>>(sizeof(int), copies[0].executingMPIrank);
 
     for (int i = 0; i < filteredCopies.size(); i++) {
         CU_ASSERT(cuStreamCreate(&filteredStreams[i], CU_STREAM_NON_BLOCKING));
 
         CU_ASSERT(cuEventCreate(&filteredStartEvents[i], CU_EVENT_DEFAULT));
         CU_ASSERT(cuEventCreate(&filteredEndEvents[i], CU_EVENT_DEFAULT));
+
+        filteredLoadSustainmentEvents[i].resize(2);
+        for (int j = 0; j < 2; j++) {
+            CU_ASSERT(cuEventCreate(&filteredLoadSustainmentEvents[i][j], CU_EVENT_DEFAULT));
+        }
     }
 
-    // fill buffers
+    if (MPIWrapper::getWorldRank() == copies[0].executingMPIrank) {
+        *((int *) (blockingVarHost->ptr)) = 0;
+        CU_ASSERT(cuMemsetD32((CUdeviceptr) blockingVarDevice->ptr, 0, 1));
+    }
+}
+
+Benchmark::~Benchmark() {
+    for (int i = 0; i < filteredCopies.size(); i++) {
+        CU_ASSERT(cuEventDestroy(filteredStartEvents[i]));
+        CU_ASSERT(cuEventDestroy(filteredEndEvents[i]));
+
+        for (int j = 0; j < 2; j++) {
+            CU_ASSERT(cuEventDestroy(filteredLoadSustainmentEvents[i][j]));
+        }
+
+        CU_ASSERT(cuStreamDestroy(filteredStreams[i]));
+    }
+
+    NvLoom::clearCurrentCopies();
+}
+
+std::vector<Copy> Benchmark::getFilteredCopies() {
+    for (auto copy : copies) {
+        if (MPIWrapper::getWorldRank() == copy.executingMPIrank) {
+            filteredCopies.push_back(copy);
+        }
+    }
+    return filteredCopies;
+}
+
+void Benchmark::verifyBuffers() {
+    for (auto &copy: getCopiesWithUniqueDestinations(copies)) {
+        // TODO this doesn't take into account the extra work for multicast reductions
+        ASSERT(0 == copy.dst->check(copy.src->uniqueId, copy.copyType, WARMUP_ITERATIONS + copy.iterations));
+    }
+}
+
+void Benchmark::fillBuffers() {
     for (auto &copy: getCopiesWithUniqueSources(copies)) {
         copy.src->memset(copy.src->uniqueId, copy.copyType, MemoryPurpose::MEMORY_SOURCE);
     }
-
     for (auto &copy: getCopiesWithUniqueDestinations(copies)) {
         copy.dst->memset(copy.dst->uniqueId, copy.copyType, MemoryPurpose::MEMORY_DESTINATION);
     }
+}
 
-    // Make sure all buffers are memseted before proceeding
-    CU_ASSERT(cuCtxSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    // warmup
-    for (int i = 0; i < filteredCopies.size(); i++) {
-        Copy &copy = filteredCopies[i];
-        doMemcpyWarmup(copy.copyType, (CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, filteredStreams[i]);
-    }
-
-    if (spinKernelsEnabled) {
-        // block streams
-        for (int i = 0; i < filteredCopies.size(); i++) {
-            CU_ASSERT(spinKernelMultistage((MPIWrapper::getWorldRank() == copies[0].executingMPIrank) ? (volatile int *) blockingVarHost.ptr : nullptr,
-                                            (volatile int *) blockingVarDevice.ptr,
-                                            filteredStreams[i]));
+void Benchmark::doMemcpyWarmup(Copy& copy, CUstream hStream) {
+    if (copy.copyType == COPY_TYPE_CE) {
+        for (int iter = 0; iter < WARMUP_ITERATIONS; iter++) {
+            CU_ASSERT(cuMemcpyAsync((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream));
         }
+    } else if (copy.copyType == COPY_TYPE_SM) {
+        copyKernel((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, WARMUP_ITERATIONS);
+    } else if (copy.copyType == COPY_TYPE_MULTICAST_WRITE) {
+        copyKernelMulticast((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, WARMUP_ITERATIONS);
+    } else if (copy.copyType == COPY_TYPE_MULTICAST_LD_REDUCE) {
+        copyKernelMulticastLdReduce((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, WARMUP_ITERATIONS);
+    } else if (copy.copyType == COPY_TYPE_MULTICAST_RED_ALL || copy.copyType == COPY_TYPE_MULTICAST_RED_SINGLE) {
+        copyKernelMulticastRed((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, WARMUP_ITERATIONS);
+    } else if (copy.copyType == COPY_TYPE_LATENCY) {
+        pointerChase((CUdeviceptr) copy.src->ptr, copy.src->allocationSize, WARMUP_LATENCY_ITERATIONS, 0, 0, hStream);
+    } else if (copy.copyType == COPY_TYPE_TMA) {
+        copyKernelTma((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, WARMUP_ITERATIONS);
+    } else if (copy.copyType == COPY_TYPE_TMA_MULTICAST_WRITE) {
+        copyKernelMulticastTma((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, WARMUP_ITERATIONS);
+    } else if (copy.copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL || copy.copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) {
+        copyKernelMulticastRedTma((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, WARMUP_ITERATIONS);
+    } else {
+        ASSERT(0);
     }
+}
 
-    // schedule work
-    for (int i = 0; i < filteredCopies.size(); i++) {
-        Copy &copy = filteredCopies[i];
-        CU_ASSERT(cuEventRecord(filteredStartEvents[i], filteredStreams[i]));
-        filteredExecutedIterations[i] = doMemcpyInSpinKernel(copy.copyType, (CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, filteredStreams[i], copy.iterations);
-        if (filteredExecutedIterations[i] == copy.iterations) {
-            CU_ASSERT(cuEventRecord(filteredEndEvents[i], filteredStreams[i]));
+unsigned long long Benchmark::doMemcpyInSpinKernel(Copy& copy, CUstream hStream, unsigned long long loopCount) {
+    if (copy.copyType == COPY_TYPE_CE) {
+        // We're only launching 128 iterations in the spinkernel guarded loop to avoid possibility of a deadlock
+        loopCount = std::min(loopCount, (unsigned long long) 128);
+        for (int iter = 0; iter < loopCount; iter++) {
+            CU_ASSERT(cuMemcpyAsync((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream));
         }
-    }
-
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    // release work
-    if (MPIWrapper::getWorldRank() == copies[0].executingMPIrank) {
-        *((int *) (blockingVarHost.ptr)) = 1;
-    }
-
-    int maxIterations = 0;
-    for (auto &copy : filteredCopies) {
-        maxIterations = std::max(maxIterations, copy.iterations);
-    }
-
-    // keep adding copies to streams, one at a time, in a round robin fashion
-    bool pendingWork = true;
-    while (pendingWork) {
-        pendingWork = false;
-        for (int i = 0; i < filteredCopies.size(); i++) {
-            Copy &copy = filteredCopies[i];
-            if (filteredExecutedIterations[i] < copy.iterations) {
-                doMemcpyBeyondSpinKernel(copy.copyType, (CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, filteredStreams[i]);
-                filteredExecutedIterations[i]++;
-                pendingWork = true;
-
-                // Only record the end event if we scheduled more iterations
-                // Otherwise, we might be re-recording the end event scheduled prior to barrier synchronization
-                if (filteredExecutedIterations[i] == copy.iterations) {
-                    CU_ASSERT(cuEventRecord(filteredEndEvents[i], filteredStreams[i]));
-                }
-            }
+    } else if (copy.copyType == COPY_TYPE_SM) {
+        copyKernel((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, loopCount);
+    } else if (copy.copyType == COPY_TYPE_MULTICAST_WRITE) {
+        copyKernelMulticast((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, loopCount);
+    } else if (copy.copyType == COPY_TYPE_MULTICAST_LD_REDUCE) {
+        copyKernelMulticastLdReduce((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, loopCount);
+    } else if (copy.copyType == COPY_TYPE_MULTICAST_RED_ALL || copy.copyType == COPY_TYPE_MULTICAST_RED_SINGLE) {
+        copyKernelMulticastRed((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, loopCount);
+    } else if (copy.copyType == COPY_TYPE_LATENCY) {
+        auto smIds = NvLoom::getLocalSMIds();
+        unsigned long long iterationsSoFar = WARMUP_LATENCY_ITERATIONS;
+        for (int j = 0; j < smIds.size(); j++) {
+            unsigned long long iterations = loopCount/smIds.size() + (j < loopCount % smIds.size() ? 1 : 0);
+            pointerChase((CUdeviceptr) copy.src->ptr, copy.src->allocationSize, iterations, iterationsSoFar, smIds[j], hStream);
+            iterationsSoFar += iterations;
         }
+        ASSERT(iterationsSoFar == loopCount + WARMUP_LATENCY_ITERATIONS);
+    } else if (copy.copyType == COPY_TYPE_TMA) {
+        copyKernelTma((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, loopCount);
+    } else if (copy.copyType == COPY_TYPE_TMA_MULTICAST_WRITE) {
+        copyKernelMulticastTma((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, loopCount);
+    } else if (copy.copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL || copy.copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) {
+        copyKernelMulticastRedTma((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, loopCount);
+    } else {
+        ASSERT(0);
     }
+    return loopCount;
+}
 
-    // Make sure all the work is finished
-    CU_ASSERT(cuCtxSynchronize());
-    MPI_Barrier(MPI_COMM_WORLD);
+void Benchmark::doMemcpyBeyondSpinKernel(Copy& copy, CUstream hStream) {
+    if (copy.copyType == COPY_TYPE_CE) {
+        CU_ASSERT(cuMemcpyAsync((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream));
+    }
+}
 
-    // calculate bandwidths
+std::vector<double> Benchmark::calculateBandwidths() {
+    std::vector<double> filteredBandwidths(filteredCopies.size());
+    std::vector<double> results;
+
     for (int i = 0; i < filteredCopies.size(); i++) {
         float elapsedMs;
         CU_ASSERT(cuEventElapsedTime(&elapsedMs, filteredStartEvents[i], filteredEndEvents[i]));
@@ -162,11 +227,6 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
         } else {
             filteredBandwidths[i] = filteredCopies[i].src->allocationSize * filteredCopies[i].iterations / (1000 * 1000 * elapsedMs);
         }
-    }
-
-    // verify buffers
-    for (auto &copy: getCopiesWithUniqueDestinations(copies)) {
-        ASSERT(0 == copy.dst->check(copy.src->uniqueId, copy.copyType, WARMUP_ITERATIONS + copy.iterations));
     }
 
     // exchange bandwidths
@@ -182,96 +242,247 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
         results.push_back(exchange);
     }
 
-    for (int i = 0; i < filteredCopies.size(); i++) {
-        CU_ASSERT(cuStreamDestroy(filteredStreams[i]));
-        CU_ASSERT(cuEventDestroy(filteredStartEvents[i]));
-        CU_ASSERT(cuEventDestroy(filteredEndEvents[i]));
-    }
-
     return results;
 }
 
-void NvLoom::doMemcpyWarmup(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream) {
-    if (copyType == COPY_TYPE_CE) {
-        for (int iter = 0; iter < WARMUP_ITERATIONS; iter++) {
-            CU_ASSERT(cuMemcpyAsync(dst, src, byteCount, hStream));
-        }
-    } else if (copyType == COPY_TYPE_SM) {
-        copyKernel(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
-    } else if (copyType == COPY_TYPE_MULTICAST_WRITE) {
-        copyKernelMulticast(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
-    } else if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) {
-        copyKernelMulticastLdReduce(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
-    } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_MULTICAST_RED_SINGLE) {
-        copyKernelMulticastRed(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
-    } else if (copyType == COPY_TYPE_LATENCY) {
-        pointerChase(src, byteCount, WARMUP_LATENCY_ITERATIONS, 0, 0, hStream);
-    } else if (copyType == COPY_TYPE_TMA) {
-        copyKernelTma(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
-    } else if (copyType == COPY_TYPE_TMA_MULTICAST_WRITE) {
-        copyKernelMulticastTma(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
-    } else if (copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL || copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) {
-        copyKernelMulticastRedTma(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
-    } else {
-        ASSERT(0);
+void Benchmark::doWarmupCopies() {
+    for (int i = 0; i < filteredCopies.size(); i++) {
+        Copy &copy = filteredCopies[i];
+        CU_ASSERT(cuStreamWriteValue32(filteredStreams[i], (CUdeviceptr) copy.counter->ptr, (int) BenchmarkState::WARMUP, 0));
+        doMemcpyWarmup(copy, filteredStreams[i]);
     }
 }
 
-unsigned long long NvLoom::doMemcpyInSpinKernel(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream, unsigned long long loopCount) {
-    if (copyType == COPY_TYPE_CE) {
-        // We're only launching 128 iterations in the spinkernel guarded loop to avoid possibility of a deadlock
-        loopCount = std::min(loopCount, (unsigned long long) 128);
-        for (int iter = 0; iter < loopCount; iter++) {
-            CU_ASSERT(cuMemcpyAsync(dst, src, byteCount, hStream));
-        }
-    } else if (copyType == COPY_TYPE_SM) {
-        copyKernel(dst, src, byteCount, hStream, loopCount);
-    } else if (copyType == COPY_TYPE_MULTICAST_WRITE) {
-        copyKernelMulticast(dst, src, byteCount, hStream, loopCount);
-    } else if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) {
-        copyKernelMulticastLdReduce(dst, src, byteCount, hStream, loopCount);
-    } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_MULTICAST_RED_SINGLE) {
-        copyKernelMulticastRed(dst, src, byteCount, hStream, loopCount);
-    } else if (copyType == COPY_TYPE_LATENCY) {
-        auto smIds = NvLoom::getLocalSMIds();
-        unsigned long long iterationsSoFar = WARMUP_LATENCY_ITERATIONS;
-        for (int j = 0; j < smIds.size(); j++) {
-            unsigned long long iterations = loopCount/smIds.size() + (j < loopCount % smIds.size() ? 1 : 0);
-            pointerChase(src, byteCount, iterations, iterationsSoFar, smIds[j], hStream);
-            iterationsSoFar += iterations;
-        }
-        ASSERT(iterationsSoFar == loopCount + WARMUP_LATENCY_ITERATIONS);
-    } else if (copyType == COPY_TYPE_TMA) {
-        copyKernelTma(dst, src, byteCount, hStream, loopCount);
-    } else if (copyType == COPY_TYPE_TMA_MULTICAST_WRITE) {
-        copyKernelMulticastTma(dst, src, byteCount, hStream, loopCount);
-    } else if (copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL || copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) {
-        copyKernelMulticastRedTma(dst, src, byteCount, hStream, loopCount);
-    } else {
-        ASSERT(0);
-    }
-    return loopCount;
-}
-
-void NvLoom::doMemcpyBeyondSpinKernel(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream) {
-    if (copyType == COPY_TYPE_CE) {
-        CU_ASSERT(cuMemcpyAsync(dst, src, byteCount, hStream));
+void Benchmark::blockStreams() {
+    for (int i = 0; i < filteredCopies.size(); i++) {
+        Copy &copy = filteredCopies[i];
+        CU_ASSERT(cuStreamWriteValue32(filteredStreams[i], (CUdeviceptr) copy.counter->ptr, (int) BenchmarkState::SYNCHRONIZE, 0));
+        CU_ASSERT(spinKernelMultistage((MPIWrapper::getWorldRank() == copies[0].executingMPIrank) ? (volatile int *) blockingVarHost->ptr : nullptr,
+                                        (volatile int *) blockingVarDevice->ptr,
+                                        filteredStreams[i]));
     }
 }
 
-// Utility function to convert CUDA format to NVML format
-static std::string convertUuid(CUuuid& cuUuid)
-{
-    uint8_t *uuidPtr = (uint8_t *) &cuUuid;
-    std::stringstream s;
-    s << "GPU-";
-    for (int i = 0; i < sizeof(CUuuid); i++) {
-        s << std::setfill('0') << std::setw(2) << std::hex << (int) uuidPtr[i];
-        if (std::set<int>{3,5,7,9}.count(i)) {
-            s << "-";
+void Benchmark::releaseStreams() {
+    if (MPIWrapper::getWorldRank() == copies[0].executingMPIrank) {
+        *((int *) (blockingVarHost->ptr)) = 1;
+    }
+}
+
+void Benchmark::scheduleWorkPreBlock() {
+    for (int i = 0; i < filteredCopies.size(); i++) {
+        Copy &copy = filteredCopies[i];
+        CU_ASSERT(cuStreamWriteValue32(filteredStreams[i], (CUdeviceptr) copy.counter->ptr, (int) BenchmarkState::RUNNING, 0));
+        CU_ASSERT(cuEventRecord(filteredStartEvents[i], filteredStreams[i]));
+
+        filteredExecutedIterations[i] = doMemcpyInSpinKernel(copy, filteredStreams[i], copy.iterations);
+
+        // If we were able to schedule all the iterations, we can record the end event and indicate we're done with the benchmarking work
+        if (filteredExecutedIterations[i] == copy.iterations) {
+            CU_ASSERT(cuEventRecord(filteredEndEvents[i], filteredStreams[i]));
+            CU_ASSERT(cuStreamWriteValue32(filteredStreams[i], (CUdeviceptr) copy.counter->ptr, (int) BenchmarkState::EXTRA_WORK, 0));
         }
     }
-    return s.str();
+}
+
+void Benchmark::scheduleWorkPostBlock() {
+    // keep adding copies to streams, one at a time, in a round robin fashion
+    bool pendingWork = true;
+    while (pendingWork) {
+        pendingWork = false;
+        for (int i = 0; i < filteredCopies.size(); i++) {
+            Copy &copy = filteredCopies[i];
+            if (filteredExecutedIterations[i] < copy.iterations) {
+                doMemcpyBeyondSpinKernel(copy, filteredStreams[i]);
+                filteredExecutedIterations[i]++;
+                pendingWork = true;
+
+                // Only record the end event if we scheduled more iterations
+                // Otherwise, we might be re-recording the end event scheduled prior to barrier synchronization
+                if (filteredExecutedIterations[i] == copy.iterations) {
+                    CU_ASSERT(cuEventRecord(filteredEndEvents[i], filteredStreams[i]));
+                    CU_ASSERT(cuStreamWriteValue32(filteredStreams[i], (CUdeviceptr) copy.counter->ptr, (int) BenchmarkState::EXTRA_WORK, 0));
+                }
+            }
+        }
+    }
+}
+
+static bool isLoadSustainmentSupported(Copy& copy) {
+    return copy.copyType != COPY_TYPE_MULTICAST_RED_SINGLE && copy.copyType != COPY_TYPE_MULTICAST_RED_ALL &&
+        copy.copyType != COPY_TYPE_TMA_MULTICAST_RED_SINGLE && copy.copyType != COPY_TYPE_TMA_MULTICAST_RED_ALL &&
+        copy.copyType != COPY_TYPE_MULTICAST_LD_REDUCE && copy.copyType != COPY_TYPE_LATENCY;
+}
+
+static int countCopiesWithLoadSustainmentSupport(std::vector<Copy> &copies) {
+    return std::count_if(copies.begin(), copies.end(), isLoadSustainmentSupported);
+}
+
+void Benchmark::doLoadSustainment() {
+    std::vector<bool> filteredStreamDone(filteredCopies.size());
+    std::vector<int> filteredLoadSustainmentPendingEventId(filteredCopies.size());
+    const int loadSustainmentIterations = 1;
+    for (int i = 0; i < filteredCopies.size(); i++) {
+        // Don't schedule extra work for copies that don't support it
+        if (!isLoadSustainmentSupported(filteredCopies[i])) {
+            continue;
+        }
+        Copy &copy = filteredCopies[i];
+        filteredExecutedIterations[i] += doMemcpyInSpinKernel(copy, filteredStreams[i], loadSustainmentIterations);
+        CU_ASSERT(cuEventRecord(filteredLoadSustainmentEvents[i][0], filteredStreams[i]));
+        // We start with just one part of extra work in the queue, so we set the pending event id to -1
+        filteredLoadSustainmentPendingEventId[i] = -1;
+    }
+
+    // We don't schedule extra work for all copies, but we still need to track them
+    // Example: if we benchmark latency and additional copies at the same time,
+    // we want to keep the streams busy until at least latency benchmark is done
+    int pendingStreams = filteredCopies.size();
+    MPI_Request barrierRequest;
+
+    // The basic idea here it to keep the streams busy with the extra work.
+    // We always want to have one part of extra work "ahead" in the queue.
+    // If there's only one part of work in the queue, we add more work to it.
+    // In each iteration, we have to:
+    // 1. Check if any streams are done with the actual benchmarking work
+    // 2. If all streams are done with the actual benchmarking work, we can signal other processes that we're done
+    // 3. If all other processes are also done, we can break the loop
+    // 4. If other processes are not done, we can add more work to the streams to keep them busy:
+    //    - If the actual benchmarking work has just finished, we schedule the next part of the extra work
+    //    - Otherwise, we use a round robin fashion to schedule the next part of the extra work
+    // 5. We continue this process until all processes are done
+    // This is a "busy wait" loop, querying CUDA events and MPI barriers in a loop.
+    while (true) {
+        if (pendingStreams > 0) {
+            for (int i = 0; i < filteredCopies.size(); i++) {
+                // Checking if the stream is done with the actual benchmarking work
+                // If it is, we can remove it from the pending count
+                if (!filteredStreamDone[i] && isEventDone(filteredEndEvents[i])) {
+                    filteredStreamDone[i] = true;
+                    pendingStreams--;
+                }
+            }
+        }
+
+        // If all streams are done with the actual benchmarking work, we can signal other processes that we're done
+        // We only want to signal once, so we set pendingStreams to -1
+        if (pendingStreams == 0) {
+            MPI_Ibarrier(MPI_COMM_WORLD, &barrierRequest);
+            pendingStreams = -1;
+        }
+
+        // Once all the streams are done with the actual work, we check whether all other processes are also done
+        // If they are, we can break the loop
+        if (pendingStreams == -1) {
+            int flag = 0;
+            MPI_Test(&barrierRequest, &flag, MPI_STATUS_IGNORE);
+            if (flag) {
+                break;
+            }
+        }
+
+        for (int i = 0; i < filteredCopies.size(); i++) {
+            // Don't schedule extra work for copies that don't support it
+            if (!isLoadSustainmentSupported(filteredCopies[i])) {
+                continue;
+            }
+            // If the stream is done with the actual benchmarking work, we can add more work to it to keep the stream busy
+            if (filteredStreamDone[i]) {
+                // In the first iteration, we immediately schedule the next part of the extra work, as soon as the actual benchmarking work is done
+                if (filteredLoadSustainmentPendingEventId[i] == -1) {
+                    filteredExecutedIterations[i] += doMemcpyInSpinKernel(filteredCopies[i], filteredStreams[i], loadSustainmentIterations);
+                    CU_ASSERT(cuEventRecord(filteredLoadSustainmentEvents[i][1], filteredStreams[i]));
+                    filteredLoadSustainmentPendingEventId[i] = 0;
+                } else {
+                    int eventId = filteredLoadSustainmentPendingEventId[i];
+                    // We're reusing two events to keep the stream busy in a double buffering fashion
+                    // One of the events is currently executing the extra work, while we can schedule work with the other event
+                    int nextEventId = (eventId + 1) % 2;
+                    // If one part of the extra work is done, we can schedule the next part
+                    if (isEventDone(filteredLoadSustainmentEvents[i][eventId])) {
+                        filteredLoadSustainmentPendingEventId[i] = nextEventId;
+                        filteredExecutedIterations[i] += doMemcpyInSpinKernel(filteredCopies[i], filteredStreams[i], loadSustainmentIterations);
+                        CU_ASSERT(cuEventRecord(filteredLoadSustainmentEvents[i][eventId], filteredStreams[i]));
+                    }
+                }
+            }
+        }
+    }
+}
+
+std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
+    if (copies.size() == 0) {return {};};
+
+    Benchmark benchmarkState(copies);
+
+    benchmarkState.fillBuffers();
+
+    // Make sure all buffers are memseted before proceeding
+    CU_ASSERT(cuCtxSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    benchmarkState.doWarmupCopies();
+
+    if (spinKernelsEnabled) {
+        benchmarkState.blockStreams();
+    }
+
+    benchmarkState.scheduleWorkPreBlock();
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    benchmarkState.releaseStreams();
+
+    benchmarkState.scheduleWorkPostBlock();
+
+    // If there's only one copy, we don't need to do extra work
+    // If there's no copies with extra work support, we don't need to do extra work
+    if (copies.size() > 1 && (countCopiesWithLoadSustainmentSupport(copies) > 0)) {
+        benchmarkState.doLoadSustainment();
+    }
+
+    // Make sure all the work is finished
+    CU_ASSERT(cuCtxSynchronize());
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    benchmarkState.verifyBuffers();
+
+    return benchmarkState.calculateBandwidths();
+}
+
+bool NvLoom::executingCopies() {
+    return !currentCopies.empty();
+}
+
+std::vector<std::string> NvLoom::dumpCurrentCopies() {
+    std::vector<std::string> copies;
+    for (int i = 0; i < currentCopies.size(); i++) {
+        Copy &copy = currentCopies[i];
+
+        int counter = *(int *) copy.counter->ptr;
+
+        std::string copyStatus = "not started";
+
+        if (counter == (int) BenchmarkState::WARMUP) {
+            copyStatus = "warmup";
+        }
+        if (counter == (int) BenchmarkState::SYNCHRONIZE) {
+            copyStatus = "synchronization";
+        }
+        if (counter == (int) BenchmarkState::RUNNING) {
+            copyStatus = "core benchmarking";
+        }
+        if (counter == (int) BenchmarkState::EXTRA_WORK) {
+            copyStatus = "extra work";
+        }
+        copies.push_back("Copy from process " + std::to_string(copy.src->MPIrank) + " (" + getProcessName(copy.src->MPIrank) + ")" +
+        " to process " + std::to_string(copy.dst->MPIrank) + " (" + getProcessName(copy.dst->MPIrank) + ")" +
+        " with type " + getCopyTypeName(copy.copyType) +
+        " and direction " + getCopyDirectionName(copy.copyDirection) +
+        " during " + copyStatus +
+        " executed by process " + std::to_string(copy.executingMPIrank) + " (" + getProcessName(copy.executingMPIrank) + ")");
+    }
+    return copies;
 }
 
 static nvmlDevice_t getNvmlDevice(int device) {
@@ -281,10 +492,14 @@ static nvmlDevice_t getNvmlDevice(int device) {
     CUuuid uuid;
     CU_ASSERT(cuDeviceGetUuid_v2(&uuid, device));
 
-    std::string nvmlUuid = convertUuid(uuid);
+    nvmlUUID_t arg;
+    arg.version = nvmlUUID_v1;
+    arg.type = NVML_UUID_TYPE_BINARY;
+    memcpy(&arg.value.bytes, &uuid, sizeof(uuid));
 
     nvmlDevice_t nvmlDev;
-    NVML_ASSERT(nvmlDeviceGetHandleByUUID((const char *) nvmlUuid.c_str(), &nvmlDev));
+    NVML_ASSERT(nvmlDeviceGetHandleByUUIDV(&arg, &nvmlDev));
+
     return nvmlDev;
 }
 
@@ -322,6 +537,47 @@ static int checkCliques() {
     return 0;
 }
 
+static void checkSystemConsistency() {
+    const int propertiesCount = 4;
+    std::vector<int> properties(propertiesCount);
+    CU_ASSERT(cuDeviceGetAttribute(&properties[0], CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, NvLoom::getLocalCuDevice()));
+    CU_ASSERT(cuDeviceGetAttribute(&properties[1], CU_DEVICE_ATTRIBUTE_HOST_NUMA_MULTINODE_IPC_SUPPORTED, NvLoom::getLocalCuDevice()));
+    CU_ASSERT(cuDeviceGetAttribute(&properties[2], CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, NvLoom::getLocalCuDevice()));
+    CU_ASSERT(cuDriverGetVersion(&properties[3]));
+
+    std::vector<std::string> propertyNames = { "CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED",
+                                               "CU_DEVICE_ATTRIBUTE_HOST_NUMA_MULTINODE_IPC_SUPPORTED",
+                                               "CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED",
+                                               "CUDA_VERSION"};
+
+    std::vector<int> propertiesExchange(MPIWrapper::getWorldSize() * propertiesCount);
+    MPI_Allgather(&properties[0], propertiesCount, MPI_INT, &propertiesExchange[0], propertiesCount, MPI_INT, MPI_COMM_WORLD);
+
+    for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
+        for (int j = 0; j < propertiesCount; j++) {
+            if (properties[j] != propertiesExchange[i * propertiesCount + j]) {
+                std::cerr << "Property " << propertyNames[j] << " is inconsistent between processes " << MPIWrapper::getWorldRank() << " and " << i << ": " << properties[j] << " != " << propertiesExchange[i * propertiesCount + j] << std::endl;
+                std::cerr << "Aborting due to system inconsistency" << std::endl;
+                ASSERT(0);
+            }
+        }
+    }
+
+    std::string nvmlDriverVersion = std::string(NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE, 0);
+    NVML_ASSERT(nvmlSystemGetDriverVersion(&nvmlDriverVersion[0], NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE));
+
+    std::string nvmlDriverVersionExchange(MPIWrapper::getWorldSize() * NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE, 0);
+    MPI_Allgather(&nvmlDriverVersion[0], NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE, MPI_CHAR, &nvmlDriverVersionExchange[0], NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE, MPI_CHAR, MPI_COMM_WORLD);
+
+    for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
+        if (0 != memcmp(&nvmlDriverVersion[0], &nvmlDriverVersionExchange[i * NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE], NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE)) {
+            std::cerr << "Driver version is inconsistent between processes " << MPIWrapper::getWorldRank() << " and " << i << ": " << nvmlDriverVersion << " != " << std::string(&nvmlDriverVersionExchange[i * NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE], NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE) << std::endl;
+            std::cerr << "Aborting due to system inconsistency" << std::endl;
+            ASSERT(0);
+        }
+    }
+}
+
 std::string trimRackGuid(std::string rackGuid) {
     if (rackGuid.find('\0') != std::string::npos) {
         rackGuid.resize(rackGuid.find('\0'));
@@ -351,6 +607,7 @@ void NvLoom::initialize(int _localDevice, std::map<std::string, std::vector<int>
     localDevice = _localDevice;
     rackToProcessMap = _rackToProcessMap;
     CU_ASSERT(cuInit(0));
+    NVML_ASSERT(nvmlInit());
 
     CU_ASSERT(cuDeviceGet(&localCuDevice, localDevice));
     CU_ASSERT(cuDevicePrimaryCtxRetain(&localCtx, localCuDevice));
@@ -366,6 +623,7 @@ void NvLoom::initialize(int _localDevice, std::map<std::string, std::vector<int>
     preloadKernels(localDevice);
     MPIWrapper::getWorldRank();
     checkCliques();
+    checkSystemConsistency();
 };
 
 void NvLoom::finalize() {
@@ -409,4 +667,44 @@ bool filterCopyType(CopyType copyType) {
             return tmaMulticastSupported() && (getMajorComputeCapability() >= 9);
     }
     return false;
+}
+
+std::string getCopyDirectionName(CopyDirection copyDirection) {
+    if (copyDirection == COPY_DIRECTION_READ) return "read";
+    if (copyDirection == COPY_DIRECTION_WRITE) return "write";
+    throw std::runtime_error("Invalid copy direction");
+}
+
+CopyDirection getCopyDirection(std::string name) {
+    if (name == "read") return COPY_DIRECTION_READ;
+    if (name == "write") return COPY_DIRECTION_WRITE;
+    throw std::runtime_error("Invalid copy direction");
+}
+
+std::string getCopyTypeName(CopyType copyType) {
+    if (copyType == COPY_TYPE_CE) return "ce";
+    if (copyType == COPY_TYPE_SM) return "sm";
+    if (copyType == COPY_TYPE_MULTICAST_WRITE) return "mc";
+    if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) return "mc_ld_reduce";
+    if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_MULTICAST_RED_SINGLE) return "mc_red";
+    if (copyType == COPY_TYPE_LATENCY) return "latency";
+    if (copyType == COPY_TYPE_TMA) return "tma";
+    if (copyType == COPY_TYPE_TMA_MULTICAST_WRITE) return "tma_mc";
+    if (copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL) return "tma_mc_red_all";
+    if (copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) return "tma_mc_red_single";
+    throw std::runtime_error("Invalid copy type");
+}
+
+CopyType getCopyType(std::string name) {
+    if (name == "ce") return COPY_TYPE_CE;
+    if (name == "sm") return COPY_TYPE_SM;
+    if (name == "mc") return COPY_TYPE_MULTICAST_WRITE;
+    if (name == "mc_ld_reduce") return COPY_TYPE_MULTICAST_LD_REDUCE;
+    if (name == "mc_red") return COPY_TYPE_MULTICAST_RED_ALL;
+    if (name == "latency") return COPY_TYPE_LATENCY;
+    if (name == "tma") return COPY_TYPE_TMA;
+    if (name == "tma_mc") return COPY_TYPE_TMA_MULTICAST_WRITE;
+    if (name == "tma_mc_red_all") return COPY_TYPE_TMA_MULTICAST_RED_ALL;
+    if (name == "tma_mc_red_single") return COPY_TYPE_TMA_MULTICAST_RED_SINGLE;
+    throw std::runtime_error("Invalid copy type");
 }

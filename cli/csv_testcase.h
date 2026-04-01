@@ -86,7 +86,6 @@ private:
     void validateGpuId(int gpuId);
     std::string getWord(std::istringstream& ss);
     int getInt(std::string str, std::string field);
-    size_t getSizeT(std::string str, std::string field);
     std::pair<int, CopyDescription> parseCSVLine(const std::string& line);
     CopyDescriptionMap parseCSV(const std::string& filePath);
     std::string getCSVOutputString(const CopyDescriptionMap& copyDescriptionMap);

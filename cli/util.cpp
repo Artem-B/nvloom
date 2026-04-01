@@ -113,6 +113,10 @@ int discoverRanks(std::map<std::string, std::vector<int>> &rackToProcessMap) {
         OUTPUT << "Process " << getPaddedProcessId(i) << " (" << &hostnameExchange[i * STRING_LENGTH] << "): device " << localDeviceIdExchange[i];
         OUTPUT << ": " << deviceName << "; rackGuid: " << trimRackGuid(rackGuidName) << std::endl;
         rackToProcessMap[trimRackGuid(rackGuidName)].push_back(i);
+
+        std::stringstream processName;
+        processName << &hostnameExchange[i * STRING_LENGTH] << ":" << localDeviceIdExchange[i];
+        NvLoom::setProcessName(i, processName.str());
     }
     OUTPUT << std::endl;
 
@@ -169,4 +173,26 @@ std::string getCudaVersion() {
     int majorVersion = driverVersion / 1000;
     int minorVersion = (driverVersion % 1000) / 10;
     return std::to_string(majorVersion) + "." + std::to_string(minorVersion);
+}
+
+size_t getBufferSizeInBytes(std::string bufferSizeStr) {
+    bufferSizeStr = toLower(bufferSizeStr);
+    size_t bufferSizeInBytes;
+    if (std::isdigit(bufferSizeStr.back())) {
+        bufferSizeInBytes = std::stoull(bufferSizeStr);
+    } else {
+        bufferSizeInBytes = std::stoull(bufferSizeStr.substr(0, bufferSizeStr.size() - 1));
+        if (bufferSizeStr.back() == 'k') {
+            bufferSizeInBytes *= (size_t) 1024;
+        } else if (bufferSizeStr.back() == 'm') {
+            bufferSizeInBytes *= (size_t) 1024 * 1024;
+        } else if (bufferSizeStr.back() == 'g') {
+            bufferSizeInBytes *= (size_t) 1024 * 1024 * 1024;
+        } else if (bufferSizeStr.back() == 't') {
+            bufferSizeInBytes *= (size_t) 1024 * 1024 * 1024 * 1024;
+        } else {
+            throw std::runtime_error("Invalid buffer size: " + bufferSizeStr);
+        }
+    }
+    return bufferSizeInBytes;
 }

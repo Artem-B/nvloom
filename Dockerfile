@@ -1,7 +1,7 @@
 # This Dockerfile is only a sample. You likely want to customize it for your needs.
 # You don't need to use containers to run nvloom.
 
-FROM nvidia/cuda:12.9.0-devel-ubuntu24.04 AS base
+FROM nvidia/cuda:13.1.0-devel-ubuntu24.04 AS base
 
 RUN export DEBIAN_FRONTEND=noninteractive && \
     apt-get update && apt-get install -y --no-install-recommends cmake libopenmpi-dev libopenmpi3t64 libboost-program-options-dev
@@ -14,10 +14,12 @@ RUN cd /usr/local/src/nvloom && \
 
 RUN install -m 755 /usr/local/src/nvloom/cli/plot_heatmaps.py /usr/local/bin
 
-FROM nvidia/cuda:12.9.0-base-ubuntu24.04
+FROM nvidia/cuda:13.1.0-base-ubuntu24.04
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 RUN export DEBIAN_FRONTEND=noninteractive && \
-    apt-get update && apt-get install -y --no-install-recommends openmpi-bin libopenmpi3t64 python3 python3-matplotlib
+    apt-get update && apt-get install -y --no-install-recommends openmpi-bin libopenmpi3t64 python3
 
 COPY --from=base /usr/local/bin/nvloom_cli /usr/local/bin
 COPY --from=base /usr/local/bin/plot_heatmaps.py /usr/local/bin

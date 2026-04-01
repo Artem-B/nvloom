@@ -1,10 +1,35 @@
 # Changelog
 
-## [1.4.1] - 2026-03-12
+## [2.0.0] - 2026-03-TBD
+
+### Added
+- Load sustainment algorithm was added to testcases that execute simultaneously multiple copies
+- CUDA Pool based multicast memory allocator
+- A "bandwidthUnit" option to specify the unit used when reporting bandwidths was added to nvloom_cli.
+- Scalable egm-to-rack testcase suite was added to nvloom_cli
+- Rack-aware all-to-one testcase suite was added to nvloom_cli
+- An option to plot a histogram of the results was added to `plot_heatmaps.py`
+- Consistency checks of system settings (such as EGM or driver versions) between processes were added to `nvloom_cli`
+
+### Changed
+- [Breaking change] nvloom_cli "bufferSize" argument is now interpreted as bytes, and supports parsing K/M/G/T units
+- Copy kernels are now launched with NVLink-centric scheduling
+- Asserts were enhanced by adding information about what copies were executing when the error happened
+- Asserts were enhanced by adding information about what stage the benchmark was when the error happened
+- Tuning of multicast copy kernels
+- When running nvloom_cli with CUDA Pool allocators, tests use the newly added CUDA Pool multicast allocator
+- Default value of the "gpuToRackSamples" argument was changed from 5 to 3
+- Plot_heatmaps.py now uses uv to handle its dependencies using PEP 723
+- Plot_heatmaps.py prints what nodes it was run on in the graph title
+- Minor performance enhancements
 
 ### Fixed
-- Fixed a bug where CSV testcase would ignore specified number of iterations
+- Fixed a bug where a CSV testcase would ignore specified number of iterations
 - Fixed a bug where nvloom_cli could hang when using "duration" option to repeat testcases
+
+### Removed
+- Support for CUDA pre-13.0 was removed
+- Support for drivers pre-580 was removed
 
 ## [1.4.0] - 2025-12-08
 

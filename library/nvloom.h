@@ -39,45 +39,6 @@ constexpr size_t DEFAULT_BUFFER_SIZE_MIB = 512;
 
 constexpr unsigned long long LATENCY_JUMP_SIZE = 128;
 
-class Copy {
-public:
-    std::shared_ptr<MemoryAllocation> dst;
-    std::shared_ptr<MemoryAllocation> src;
-    CopyDirection copyDirection;
-    CopyType copyType;
-    int executingMPIrank;
-    int iterations;
-
-    Copy(std::shared_ptr<MemoryAllocation> _dst, std::shared_ptr<MemoryAllocation> _src, CopyDirection _copyDirection, CopyType _copyType, int _iterations = DEFAULT_ITERATIONS) :
-        dst(_dst),
-        src(_src),
-        copyDirection(_copyDirection),
-        copyType(_copyType),
-        iterations(_iterations) {
-
-        if (copyDirection == COPY_DIRECTION_READ) {
-            executingMPIrank = dst->MPIrank;
-        } else {
-            executingMPIrank = src->MPIrank;
-        }
-    }
-};
-
-// Latency is a special kind of copy operation
-// The destination MemoryAllocation is an empty allocation, only indicating which node is executing the benchmark
-// The source MemoryAllocation is the memory to which access is being benchmarked
-// We calculate the size of the calculation to fit all the iterations in
-template <typename T>
-class Latency : public Copy {
-public:
-    Latency(int _memoryLocation, int _executingMPIrank, unsigned long long _iterations = DEFAULT_LATENCY_ITERATIONS) :
-        Copy(std::make_shared<MemoryAllocation>(_executingMPIrank),
-             std::make_shared<T>((_iterations + WARMUP_LATENCY_ITERATIONS) * LATENCY_JUMP_SIZE, _memoryLocation),
-             COPY_DIRECTION_READ,
-             COPY_TYPE_LATENCY,
-             _iterations) {}
-};
-
 class MPIWrapper {
 private:
     int worldSize;
@@ -96,8 +57,8 @@ private:
 
 public:
     static MPIWrapper& instance() {
-         static MPIWrapper mpiWrapper;
-         return mpiWrapper;
+        static MPIWrapper mpiWrapper;
+        return mpiWrapper;
     }
 
     static int getWorldSize() {
@@ -106,6 +67,34 @@ public:
     static int getWorldRank() {
         return instance().worldRank;
     }
+};
+
+class Copy {
+public:
+    std::shared_ptr<MemoryAllocation> dst;
+    std::shared_ptr<MemoryAllocation> src;
+    std::shared_ptr<AllocationPool<HostMemoryAllocation>> counter;
+    CopyDirection copyDirection;
+    CopyType copyType;
+    int executingMPIrank;
+    int iterations;
+
+    Copy(std::shared_ptr<MemoryAllocation> _dst, std::shared_ptr<MemoryAllocation> _src, CopyDirection _copyDirection, CopyType _copyType, int _iterations = DEFAULT_ITERATIONS);
+};
+
+// Latency is a special kind of copy operation
+// The destination MemoryAllocation is an empty allocation, only indicating which node is executing the benchmark
+// The source MemoryAllocation is the memory to which access is being benchmarked
+// We calculate the size of the calculation to fit all the iterations in
+template <typename T>
+class Latency : public Copy {
+public:
+    Latency(int _memoryLocation, int _executingMPIrank, unsigned long long _iterations = DEFAULT_LATENCY_ITERATIONS) :
+        Copy(std::make_shared<MemoryAllocation>(_executingMPIrank),
+             std::make_shared<T>((_iterations + WARMUP_LATENCY_ITERATIONS) * LATENCY_JUMP_SIZE, _memoryLocation),
+             COPY_DIRECTION_READ,
+             COPY_TYPE_LATENCY,
+             _iterations) {}
 };
 
 class MPIOutput {
@@ -126,6 +115,59 @@ class MPIOutput {
 };
 extern MPIOutput OUTPUT;
 
+enum class BenchmarkState {
+    NOT_STARTED = 0,
+    WARMUP,
+    SYNCHRONIZE,
+    RUNNING,
+    EXTRA_WORK
+};
+
+class Benchmark {
+private:
+    std::vector<Copy> copies;
+    std::vector<Copy> filteredCopies;
+    std::vector<CUstream> filteredStreams;
+    std::vector<CUevent> filteredStartEvents;
+    std::vector<CUevent> filteredEndEvents;
+    std::vector<std::vector<CUevent>> filteredLoadSustainmentEvents;
+    std::vector<int> filteredExecutedIterations;
+
+    std::shared_ptr<AllocationPool<HostMemoryAllocation>> blockingVarHost;
+    std::shared_ptr<AllocationPool<MultinodeMemoryAllocationUnicast>> blockingVarDevice;
+
+    std::vector<Copy> getFilteredCopies();
+
+    // Launch loopCount copy iterations, unconditionally
+    void doMemcpyWarmup(Copy& copy, CUstream hStream);
+
+    // Launch up to loopCount iterations, accounting for the spinKernel guarded loop
+    // Returns the number of iterations actually launched
+    unsigned long long doMemcpyInSpinKernel(Copy& copy, CUstream hStream, unsigned long long loopCount);
+
+    // Launch a single copy iteration
+    // Designed to be called after the spinKernel is released.
+    // NOOP for non-CE copies, as they're not impacted by the spinKernel issue.
+    void doMemcpyBeyondSpinKernel(Copy& copy, CUstream hStream);
+
+public:
+    Benchmark(std::vector<Copy> _copies);
+    ~Benchmark();
+
+    void fillBuffers();
+    void verifyBuffers();
+
+    void blockStreams();
+    void releaseStreams();
+
+    void doWarmupCopies();
+    void scheduleWorkPreBlock();
+    void scheduleWorkPostBlock();
+    void doLoadSustainment();
+
+    std::vector<double> calculateBandwidths();
+};
+
 class NvLoom {
 private:
     static inline int localDevice;
@@ -138,19 +180,8 @@ private:
     static inline std::map<std::string, std::vector<int> > rackToProcessMap;
     static inline std::vector<int> localSMIds;
     static inline bool spinKernelsEnabled = true;
-
-    // Launch loopCount copy iterations, unconditionally
-    static void doMemcpyWarmup(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream);
-
-    // Launch up to loopCount iterations, accounting for the spinKernel guarded loop
-    // Returns the number of iterations actually launched
-    static unsigned long long doMemcpyInSpinKernel(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream, unsigned long long loopCount);
-
-    // Launch a single copy iteration
-    // Designed to be called after the spinKernel is released.
-    // NOOP for non-CE copies, as they're not impacted by the spinKernel issue.
-    static void doMemcpyBeyondSpinKernel(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream);
-
+    static inline std::vector<Copy> currentCopies;
+    static inline std::map<int, std::string> processNameMap;
 public:
     static std::vector<double> doBenchmark(std::vector<Copy> copies);
 
@@ -172,11 +203,22 @@ public:
     // spinKernels will not be launched, but spinkernel-related memory allocations and memsets will still occur to minimize the changes in behavior.
     static void disableSpinKernels() { spinKernelsEnabled = false; }
     static void finalize();
+    static bool executingCopies();
+    static void setCurrentCopies(std::vector<Copy> _copies) { currentCopies = _copies; };
+    static void clearCurrentCopies() { currentCopies.clear(); };
+    static std::vector<std::string> dumpCurrentCopies();
+    static std::string getProcessName(int rank) { return processNameMap[rank]; };
+    static void setProcessName(int rank, std::string name) { processNameMap[rank] = name; };
 };
 
 std::string getRackGuid(int device);
 std::string trimRackGuid(std::string rackGuid);
 
 bool filterCopyType(CopyType copyType);
+
+std::string getCopyDirectionName(CopyDirection copyDirection);
+CopyDirection getCopyDirection(std::string name);
+std::string getCopyTypeName(CopyType copyType);
+CopyType getCopyType(std::string name);
 
 #endif

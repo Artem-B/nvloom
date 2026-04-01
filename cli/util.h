@@ -24,6 +24,9 @@
 #include <iomanip>
 #include <string>
 #include <cctype>
+#include <stdexcept>
+
+extern char bandwidthUnit;
 
 // returns which GPU should this process run on
 int discoverRanks(std::map<std::string, std::vector<int>> &rackToProcessMap);
@@ -34,6 +37,11 @@ enum Buffering {
 };
 
 class OutputMatrix {
+public:
+    enum class MeasurementType {
+        BANDWIDTH,
+        LATENCY,
+    };
 private:
     std::string name;
     int dimX;
@@ -46,7 +54,9 @@ private:
     std::vector<std::string> labelsY;
     std::vector<int> columnSeparators;
     Buffering buffering;
+    MeasurementType measurementType;
     std::string unit;
+    double unitMultiplier;
 
     void fillLabels(std::vector<std::string>& vec, int size) {
         for (int i = 0; i < size; i++) {
@@ -57,9 +67,32 @@ private:
     void incrementalPrint(int stage);
 
 public:
-    OutputMatrix(std::string _name, int _dimX, int _dimY, Buffering _buffering = BUFFERING_ENABLED, std::string _unit = "GB/s") : name(_name), dimX(_dimX), dimY(_dimY), data(dimX * dimY, 0), initialized(dimX * dimY, false), notes(dimX * dimY, ""), buffering(_buffering), unit(_unit) {
+    OutputMatrix(std::string _name, int _dimX, int _dimY, Buffering _buffering = BUFFERING_ENABLED, MeasurementType _measurementType = MeasurementType::BANDWIDTH) : name(_name), dimX(_dimX), dimY(_dimY), data(dimX * dimY, 0), initialized(dimX * dimY, false), notes(dimX * dimY, ""), buffering(_buffering), measurementType(_measurementType) {
         fillLabels(labelsX, dimX);
         fillLabels(labelsY, dimY);
+
+        unitMultiplier = 1.0;
+        if (measurementType == MeasurementType::BANDWIDTH) {
+            if (bandwidthUnit == 'k') {
+                unitMultiplier = 1000*1000;
+                unit = "KB/s";
+            } else if (bandwidthUnit == 'm') {
+                unitMultiplier = 1000;
+                unit = "MB/s";
+            } else if (bandwidthUnit == 'g') {
+                unitMultiplier = 1;
+                unit = "GB/s";
+            } else if (bandwidthUnit == 't') {
+                unitMultiplier = (double) 1.0/1000.0;
+                unit = "TB/s";
+            } else {
+                throw std::runtime_error("Invalid bandwidth unit passed to OutputMatrix constructor: " + std::to_string(bandwidthUnit));
+            }
+        } else if (measurementType == MeasurementType::LATENCY) {
+            unit = "ns";
+        } else {
+            throw std::runtime_error("Invalid measurement type passed to OutputMatrix constructor");
+        }
     }
 
     ~OutputMatrix() {
@@ -101,6 +134,8 @@ public:
         ASSERT(x < dimX);
         ASSERT(y >= 0);
         ASSERT(y < dimY);
+
+        value *= unitMultiplier;
 
         int id = y * dimX + x;
         data[id] = value;
@@ -160,6 +195,16 @@ static inline std::string toLower(std::string s) {
     });
     return s;
 }
+
+static inline size_t getSizeT(std::string str, std::string field) {
+    try {
+        return std::stoull(str);
+    } catch (const std::invalid_argument& e) {
+        throw std::runtime_error("Invalid " + field + ": " + str);
+    }
+}
+
+size_t getBufferSizeInBytes(std::string bufferSizeStr);
 
 std::string getDriverVersion();
 std::string getCudaVersion();

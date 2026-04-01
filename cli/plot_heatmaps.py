@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
 #
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
@@ -15,6 +15,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "ClusterShell~=1.0",
+#     "matplotlib~=3.0",
+#     "numpy~=2.0",
+# ]
+# ///
+
 import argparse
 import math
 import matplotlib.pyplot as plt
@@ -23,6 +32,7 @@ import os
 import pathlib
 import sys
 from collections.abc import Iterator
+from ClusterShell.NodeSet import NodeSet
 
 
 def get_arg_parser() -> argparse.ArgumentParser:
@@ -38,10 +48,13 @@ def get_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plot_size", default=32, type=float)
     parser.add_argument("--file_format", default="png", choices=list(plt.gcf().canvas.get_supported_filetypes().keys()))
     parser.add_argument("--no_heatmap_data_labels", action="store_true")
+    parser.add_argument("--filename_prefix", default="")
+    parser.add_argument("--histogram", default=False, action="store_true")
+    parser.add_argument("--histogram_dynamic_min", default=False, action="store_true")
+    parser.add_argument("--histogram_bins", default=20, type=int)
     return parser
 
 
-ARGS = get_arg_parser().parse_args()
 TEXTCOLORS = ["black", "white"]
 
 
@@ -56,23 +69,24 @@ def flatten_results(results: list[list[float]]) -> Iterator[float]:
                 yield y
 
 
-def generate_stats_plot(stats: plt.Axes,
+def generate_stats_plot(args: argparse.Namespace,
+                        stats: plt.Axes,
                         additional_values: list[float],
                         color_threshold: float,
                         fontsize: float) -> None:
     im_stats = stats.imshow([additional_values], cmap="YlGn")
-    im_stats.set_clim(ARGS.heatmap_lower_limit, ARGS.heatmap_upper_limit)
+    im_stats.set_clim(args.heatmap_lower_limit, args.heatmap_upper_limit)
     for i in range(len(additional_values)):
         stats.text(i, 0, f"{additional_values[i]:.0f}",
                    ha="center",
                    va="center",
                    color=TEXTCOLORS[int(additional_values[i]) > color_threshold],
                    fontsize=fontsize)
-    stats.set_xticks(np.arange(3), labels=["min", "avg", "max"], fontsize=ARGS.legend_fontsize)
+    stats.set_xticks(np.arange(3), labels=["min", "avg", "max"], fontsize=args.legend_fontsize)
     stats.set_xticks(np.arange(2)+.5, minor=True)
     stats.set_yticks([])
     stats.spines[:].set_visible(False)
-    stats.set_title("summary", fontsize=ARGS.title_fontsize)
+    stats.set_title("summary", fontsize=args.title_fontsize)
     stats.grid(which="minor", color="w", linestyle="-", linewidth=3)
     stats.tick_params(which="minor", bottom=False, left=False)
 
@@ -144,27 +158,28 @@ def get_stats_values(results: list[list[float]]) -> tuple[float, float, float]:
     return min(results_flattened), sum(results_flattened)/len(results_flattened), max(results_flattened)
 
 
-def validate_limits(min_value: float, max_value: float) -> None:
-    if ARGS.heatmap_upper_limit:
-        assert min_value < float(ARGS.heatmap_upper_limit), \
-               f"heatmap_upper_limit: {float(ARGS.heatmap_upper_limit)} is smaller than minimum value " \
+def validate_limits(args: argparse.Namespace, min_value: float, max_value: float) -> None:
+    if args.heatmap_upper_limit:
+        assert min_value < float(args.heatmap_upper_limit), \
+               f"heatmap_upper_limit: {float(args.heatmap_upper_limit)} is smaller than minimum value " \
                f"of plotted results: {min_value}. Aborting"
 
-    if ARGS.heatmap_lower_limit:
-        assert max_value > float(ARGS.heatmap_lower_limit), \
-               f"heatmap_lower_limit: {float(ARGS.heatmap_lower_limit)} is bigger than maximum value " \
+    if args.heatmap_lower_limit:
+        assert max_value > float(args.heatmap_lower_limit), \
+               f"heatmap_lower_limit: {float(args.heatmap_lower_limit)} is bigger than maximum value " \
                f"of plotted results: {max_value}. Aborting"
 
 
-def get_data_fontsize(results: list[list[float]]) -> float:
+def get_data_fontsize(args: argparse.Namespace, results: list[list[float]]) -> float:
     results_flattened = list(flatten_results(results))
     max_value_len = math.ceil(math.log10(max(results_flattened)))
     max_value_scaling_factor = math.pow((4. / max(max_value_len, 4)), 2.5)
     max_dim = max(len(results), len(results[0]))
-    return ARGS.data_fontsize_scaling_factor * 60. * max_value_scaling_factor * (6. / max_dim)
+    return args.data_fontsize_scaling_factor * 60. * max_value_scaling_factor * (6. / max_dim)
 
 
-def format_heatmap(heatmap: plt.Axes,
+def format_heatmap(args: argparse.Namespace,
+                   heatmap: plt.Axes,
                    results: list[list[float]],
                    labels_x: list[str],
                    labels_y: list[str],
@@ -188,22 +203,102 @@ def format_heatmap(heatmap: plt.Axes,
     apply_row_separators(heatmap, results, row_separators, rack_guids)
 
     heatmap.grid(which="minor", color="w", linestyle="-", linewidth=3)
-    heatmap.set_title(name, fontsize=ARGS.title_fontsize)
+    heatmap.set_title(f"{name}\n{get_nodes_description(labels_y)}", fontsize=args.title_fontsize)
     main_heatmap_labelsize = 9 * math.pow(72 / len(results), 1/5)
     heatmap.tick_params(labelbottom=True, labeltop=True, labelsize=main_heatmap_labelsize)
 
 
-def create_main_heatmap(heatmap: plt.Axes, results: list[list[float]], unit: str) -> None:
+def create_main_heatmap(args: argparse.Namespace,
+                        heatmap: plt.Axes,
+                        results: list[list[float]],
+                        unit: str) -> None:
     im = heatmap.imshow(results, cmap="YlGn")
     # set heatmap color limits
-    im.set_clim(ARGS.heatmap_lower_limit, ARGS.heatmap_upper_limit)
+    im.set_clim(args.heatmap_lower_limit, args.heatmap_upper_limit)
 
     cbar = heatmap.figure.colorbar(im, ax=heatmap)
-    cbar.ax.tick_params(labelsize=ARGS.legend_fontsize)
-    cbar.ax.set_ylabel(unit, rotation=-90, va="bottom", labelpad=20, fontsize=ARGS.legend_fontsize)
+    cbar.ax.tick_params(labelsize=args.legend_fontsize)
+    cbar.ax.set_ylabel(unit, rotation=-90, va="bottom", labelpad=20, fontsize=args.legend_fontsize)
 
 
-def plot_result(name: str,
+def plot_heatmap(args: argparse.Namespace,
+                 name: str,
+                 results: list[list[float]],
+                 labels_x: list[str],
+                 labels_y: list[str],
+                 columns_separators: list[int],
+                 row_separators: list[int],
+                 rack_guids: list[str],
+                 unit: str) -> plt.Figure:
+    results = convert_results_to_float(results)
+
+    # if values are NaN, there's nothing to plot
+    if all(all(math.isnan(elem) for elem in sublist) for sublist in results):
+        return
+
+    min_value, avg_value, max_value = get_stats_values(results)
+    validate_limits(args, min_value, max_value)
+
+    fig, (heatmap, stats) = plt.subplots(2, 1, gridspec_kw={"height_ratios": [math.sqrt(len(labels_y)), 1]})
+    create_main_heatmap(args, heatmap, results, unit)
+
+    fontsize = get_data_fontsize(args, results)
+
+    # depending on the field value, we will be adjusting text color to make it visible
+    threshold = max_value/2.
+
+    # generate the "stats" plot, with min/avg/max
+    stats_fontsize = math.floor(math.sqrt(len(labels_y))) * fontsize
+    generate_stats_plot(args, stats, [min_value, avg_value, max_value], threshold, stats_fontsize)
+
+    # create numerical labels for each heatmap field
+    if not args.no_heatmap_data_labels:
+        apply_heatmap_data_labels(heatmap, results, threshold, fontsize)
+
+    format_heatmap(args, heatmap, results, labels_x, labels_y, columns_separators, row_separators, rack_guids, name)
+    return fig
+
+
+def get_unique_nodes_from_labels(nodes: list[str]) -> list[str]:
+    nodes = [node.split("/")[0] for node in nodes]
+    return list(set(nodes))
+
+
+def get_nodes_string(nodes: list[str]) -> str:
+    return str(NodeSet(",".join(nodes)))
+
+
+def get_nodes_description(nodes: list[str]) -> str:
+    unique_nodes = get_unique_nodes_from_labels(nodes)
+    nodes_string = get_nodes_string(unique_nodes)
+    nodes_count = len(unique_nodes)
+    return f"{nodes_string} ({nodes_count} nodes)" if nodes_count > 1 else nodes_string
+
+
+def plot_histogram(args: argparse.Namespace,
+                   name: str,
+                   results: list[float],
+                   nodes: list[str],
+                   unit: str) -> plt.Figure:
+    fig, ax = plt.subplots()
+    fig.set_size_inches(args.plot_size, args.plot_size)
+    if args.histogram_dynamic_min:
+        range = (min(results), max(results))
+    else:
+        range = (0, max(results))
+    ax.hist(list(results), bins=args.histogram_bins, color="green", edgecolor="white", range=range)
+    ax.set_title(f"{name}\n{len(results)} total datapoints\n{get_nodes_description(nodes)}",
+                 fontsize=args.title_fontsize)
+    ax.set_xlabel(unit, fontsize=args.legend_fontsize)
+    ax.set_ylabel("Count", fontsize=args.legend_fontsize)
+    ax.grid(True)
+    ax.tick_params(labelsize=args.legend_fontsize)
+    fig.tight_layout()
+    return fig
+
+
+def plot_result(args: argparse.Namespace,
+                name: str,
                 results: list[list[str]],
                 labels_x: list[str],
                 labels_y: list[str],
@@ -221,31 +316,15 @@ def plot_result(name: str,
     if all(all(math.isnan(elem) for elem in sublist) for sublist in results):
         return
 
-    min_value, avg_value, max_value = get_stats_values(results)
-    validate_limits(min_value, max_value)
+    if not args.histogram:
+        fig = plot_heatmap(args, name, results, labels_x, labels_y, columns_separators, row_separators, rack_guids, unit)
+    else:
+        fig = plot_histogram(args, name, list(flatten_results(results)), labels_y, unit)
 
-    fig, (heatmap, stats) = plt.subplots(2, 1, gridspec_kw={"height_ratios": [math.sqrt(len(labels_y)), 1]})
-    create_main_heatmap(heatmap, results, unit)
-
-    fontsize = get_data_fontsize(results)
-
-    # depending on the field value, we will be adjusting text color to make it visible
-    threshold = max_value/2.
-
-    # generate the "stats" plot, with min/avg/max
-    stats_fontsize = math.floor(math.sqrt(len(labels_y))) * fontsize
-    generate_stats_plot(stats, [min_value, avg_value, max_value], threshold, stats_fontsize)
-
-    # create numerical labels for each heatmap field
-    if not ARGS.no_heatmap_data_labels:
-        apply_heatmap_data_labels(heatmap, results, threshold, fontsize)
-
-    format_heatmap(heatmap, results, labels_x, labels_y, columns_separators, row_separators, rack_guids, name)
-
-    fig.tight_layout()
-    fig.set_size_inches(ARGS.plot_size, ARGS.plot_size)
+    # fig.tight_layout()
+    fig.set_size_inches(args.plot_size, args.plot_size)
     try:
-        plt.savefig(str(path / f"{name}.{ARGS.file_format}"))
+        plt.savefig(str(path / f"{args.filename_prefix}{name}.{args.file_format}"))
     except Exception as e:
         print(f"Error saving plot to file: {e}")
     plt.close(fig)
@@ -314,12 +393,20 @@ def parse_unit(line: str) -> str:
 
 
 def main() -> None:
+    parser = get_arg_parser()
+
+    if len(sys.argv) == 1 and sys.stdin.isatty():
+        parser.print_help()
+        sys.exit(0)
+
+    args = parser.parse_args()
+
     # where to draw lines between rows to indicate different racks
     row_separators = []
     process_to_gpu_list = []
     rack_guid_list = []
 
-    path = pathlib.Path(ARGS.path)
+    path = pathlib.Path(args.path)
     try:
         path.mkdir(parents=True, exist_ok=True)
     except Exception as e:
@@ -367,7 +454,8 @@ def main() -> None:
             labels_y = enrich_labels_y(labels_y, process_to_gpu_list)
 
             try:
-                plot_result(name,
+                plot_result(args,
+                            name,
                             results,
                             filtered_labels_x,
                             labels_y,

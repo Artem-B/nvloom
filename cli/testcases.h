@@ -17,7 +17,6 @@
 
 #ifndef TESTCASES_H_
 #define TESTCASES_H_
-
 #include <memory>
 #include <map>
 
@@ -41,10 +40,6 @@ enum AllocatorStrategy {
 
 std::string getCopyCountName(CopyCount copyCount);
 CopyCount getCopyCount(std::string name);
-std::string getCopyDirectionName(CopyDirection copyDirection);
-CopyDirection getCopyDirection(std::string name);
-std::string getCopyTypeName(CopyType copyType);
-CopyType getCopyType(std::string name);
 
 class Testcase {
 public:

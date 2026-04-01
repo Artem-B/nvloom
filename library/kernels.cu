@@ -22,8 +22,10 @@
 #include <cuda/ptx>
 #include <algorithm>
 #include <cuda_awbarrier_primitives.h>
+#include <nvml.h>
 
-constexpr unsigned int numThreadPerBlock = 512;
+constexpr unsigned int defaultNumThreadPerBlock = 512;
+constexpr unsigned int multicastNumThreadPerBlock = 1024;
 
 template<typename T>
 using write_to_memory = void (*)(T*, T);
@@ -39,26 +41,21 @@ __device__ void write_to_regular_memory(T *dst, T val) {
 template<typename T>
 __device__ void write_to_multicast_memory(T *dst, T val) {
 #if __CUDA_ARCH__ >= 900
-    static_assert(sizeof(T) == 4, "");
-    asm ("multimem.st.weak.global.b32 [%0], %1;" : : "l"(dst), "r"(val) : "memory" );
+    cuda::ptx::multimem_st(cuda::ptx::sem_weak, dst, val);
 #endif
 }
 
 template<typename T>
 __device__ void reduce_from_multicast_ld_reduce(T *dst, T *val) {
 #if __CUDA_ARCH__ >= 900
-    static_assert(sizeof(T) == 4, "");
-    uint result;
-    asm ("multimem.ld_reduce.weak.global.add.u32 %0, [%1];" : "=r"(result) : "l"(val) : "memory");
-    *dst = result;
+    *dst = cuda::ptx::multimem_ld_reduce(cuda::ptx::sem_weak, cuda::ptx::op_add, val);
 #endif
 }
 
 template<typename T>
 __device__ void reduce_from_multicast_red(T *dst, T *val) {
 #if __CUDA_ARCH__ >= 900
-    static_assert(sizeof(T) == 4, "");
-    asm ("multimem.red.global.add.u32 [%0], %1;" : "+l"(dst) : "r"(*val) : "memory");
+    cuda::ptx::multimem_red(cuda::ptx::sem_relaxed, cuda::ptx::scope_cta, cuda::ptx::op_add, dst, *val);
 #endif
 }
 
@@ -133,16 +130,26 @@ __global__ void simpleMemcpyKernel(unsigned int totalThreadCount, unsigned long 
 }
 
 template<typename T, auto kernel>
-void launchCopyKernel(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
-    unsigned int totalThreadCount = NvLoom::getLocalMultiprocessorCount() * numThreadPerBlock;
+void launchCopyKernel(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount, unsigned int numThreadPerBlock) {
+    int numBlocks = std::min(NvLoom::getLocalMultiprocessorCount(), 128);
+
+    unsigned int totalThreadCount = numBlocks * numThreadPerBlock;
 
     // adjust size to elements (size is multiple of MB, so no truncation here)
     size_t sizeInElement = size / sizeof(T);
 
-    dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
-    dim3 blockDim(numThreadPerBlock, 1, 1);
-    kernel <<<gridDim, blockDim, 0, stream>>> (totalThreadCount, loopCount, (T *) dstBuffer, (T *) srcBuffer, sizeInElement);
-    CUDA_ASSERT(cudaPeekAtLastError());
+    cudaLaunchConfig_t config = {0};
+    config.gridDim = dim3(numBlocks, 1, 1);
+    config.blockDim = dim3(numThreadPerBlock, 1, 1);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute cudaAttr;
+    cudaAttr.id = cudaLaunchAttributeNvlinkUtilCentricScheduling;
+    cudaAttr.val.nvlinkUtilCentricScheduling = 1;
+    config.attrs = &cudaAttr;
+    config.numAttrs = 1;
+
+    CUDA_ASSERT(cudaLaunchKernelEx(&config, kernel, totalThreadCount, loopCount, (T *) dstBuffer, (T *) srcBuffer, sizeInElement));
 }
 
 // TMA kernels
@@ -327,14 +334,24 @@ __global__ void memcpyKernelTma(unsigned long long loopCount, char* dst, char* s
 
 template<cp_async_bulk_shared_to_global_func write>
 void launchCopyKernelTma(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
-    dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
-    dim3 blockDim(1, 1, 1);
-    memcpyKernelTma<TMA_CHUNK_SIZE_BYTES, write> <<<gridDim, blockDim, sizeof(SMEM<TMA_CHUNK_SIZE_BYTES>), stream>>> (loopCount, (char *) dstBuffer, (char *) srcBuffer, size);
-    CUDA_ASSERT(cudaPeekAtLastError());
+    int numBlocks = std::min(NvLoom::getLocalMultiprocessorCount(), 128);
+
+    cudaLaunchConfig_t config = {0};
+    config.gridDim = dim3(numBlocks, 1, 1);
+    config.blockDim = dim3(1, 1, 1);
+    config.dynamicSmemBytes = sizeof(SMEM<TMA_CHUNK_SIZE_BYTES>);
+    config.stream = stream;
+    cudaLaunchAttribute cudaAttr;
+    cudaAttr.id = cudaLaunchAttributeNvlinkUtilCentricScheduling;
+    cudaAttr.val.nvlinkUtilCentricScheduling = 1;
+    config.attrs = &cudaAttr;
+    config.numAttrs = 1;
+
+    CUDA_ASSERT(cudaLaunchKernelEx(&config, memcpyKernelTma<TMA_CHUNK_SIZE_BYTES, write>, loopCount, (char *) dstBuffer, (char *) srcBuffer, size));
 }
 
 void copyKernel(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
-    launchCopyKernel<uint4, stridingMemcpyKernel<uint4, write_to_regular_memory> >(dstBuffer, srcBuffer, size, stream, loopCount);
+    launchCopyKernel<uint4, stridingMemcpyKernel<uint4, write_to_regular_memory> >(dstBuffer, srcBuffer, size, stream, loopCount, defaultNumThreadPerBlock);
 }
 
 void copyKernelTma(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
@@ -350,15 +367,15 @@ void copyKernelMulticastRedTma(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, siz
 }
 
 void copyKernelMulticast(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
-    launchCopyKernel<uint, stridingMemcpyKernel<uint, write_to_multicast_memory> >(dstBuffer, srcBuffer, size, stream, loopCount);
+    launchCopyKernel<uint, stridingMemcpyKernel<uint, write_to_multicast_memory> >(dstBuffer, srcBuffer, size, stream, loopCount, multicastNumThreadPerBlock);
 }
 
 void copyKernelMulticastLdReduce(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
-    launchCopyKernel<uint, simpleMemcpyKernel<uint, reduce_from_multicast_ld_reduce<uint> > >(dstBuffer, srcBuffer, size, stream, loopCount);
+    launchCopyKernel<uint, simpleMemcpyKernel<uint, reduce_from_multicast_ld_reduce<uint> > >(dstBuffer, srcBuffer, size, stream, loopCount, multicastNumThreadPerBlock);
 }
 
 void copyKernelMulticastRed(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
-    launchCopyKernel<uint, simpleMemcpyKernel<uint, reduce_from_multicast_red<uint> > >(dstBuffer, srcBuffer, size, stream, loopCount);
+    launchCopyKernel<uint, simpleMemcpyKernel<uint, reduce_from_multicast_red<uint> > >(dstBuffer, srcBuffer, size, stream, loopCount, multicastNumThreadPerBlock);
 }
 
 __global__ void spinKernelDeviceMultistage(volatile int *latch1, volatile int *latch2, const unsigned long long timeoutClocks) {
@@ -423,7 +440,7 @@ __global__ void patternFillKernel(uint* dst, int seed, size_t bufferSize, int gr
 
 void memsetBuffer(void *ptr, int seed, size_t size, CUstream stream, int groupId, int groupSize) {
     dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
-    dim3 blockDim(numThreadPerBlock, 1, 1);
+    dim3 blockDim(defaultNumThreadPerBlock, 1, 1);
     patternFillKernel<<<gridDim, blockDim, 0, stream>>>((uint *)ptr, seed, size, groupId, groupSize);
     CUDA_ASSERT(cudaPeekAtLastError());
 }
@@ -486,20 +503,23 @@ __global__ void patternCheckKernel(uint* buffer, int seed, size_t bufferSize, un
 }
 
 unsigned long long checkBuffer(void *ptr, int seed, size_t size, CUstream stream, int groupSize, int multiplier = 1) {
-    unsigned long long *errorCount;
-    CU_ASSERT(cuMemAlloc((CUdeviceptr *) &errorCount, sizeof(*errorCount)));
+    // Cache the error count pointer to avoid reallocating it on every call
+    // We can't use AllocationPool here because checkBuffer is not called uniconditionally by every single process
+    // Otherwise the uniqueId of memory allocations would be different for each process, and the check would fail
+    static unsigned long long *errorCount;
+    if (errorCount == nullptr) {
+        CU_ASSERT(cuMemAlloc((CUdeviceptr *) &errorCount, sizeof(*errorCount)));
+    }
     CU_ASSERT(cuMemsetD8((CUdeviceptr) errorCount, 0, sizeof(*errorCount)));
 
     dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
-    dim3 blockDim(numThreadPerBlock, 1, 1);
+    dim3 blockDim(defaultNumThreadPerBlock, 1, 1);
     patternCheckKernel<<<gridDim, blockDim, 0, stream>>>((uint *)ptr, seed, size, errorCount, groupSize, multiplier);
     CUDA_ASSERT(cudaPeekAtLastError());
     CU_ASSERT(cuStreamSynchronize(stream));
 
     unsigned long long errorCountCopy;
     CU_ASSERT(cuMemcpy((CUdeviceptr) &errorCountCopy, (CUdeviceptr) errorCount, sizeof(errorCountCopy)));
-
-    CU_ASSERT(cuMemFree((CUdeviceptr) errorCount));
 
     return errorCountCopy;
 }
@@ -533,7 +553,7 @@ __global__ void pointerChaseFillKernel(size_t* dst, size_t bufferSize) {
 
 void pointerChaseFill(void *ptr, size_t size, CUstream stream) {
     dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
-    dim3 blockDim(numThreadPerBlock, 1, 1);
+    dim3 blockDim(defaultNumThreadPerBlock, 1, 1);
     pointerChaseFillKernel<<<gridDim, blockDim, 0, stream>>>((size_t *)ptr, size);
     CUDA_ASSERT(cudaPeekAtLastError());
 }

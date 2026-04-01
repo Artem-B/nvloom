@@ -46,46 +46,6 @@ CopyCount getCopyCount(std::string name) {
     throw std::runtime_error("Invalid copy count");
 }
 
-std::string getCopyDirectionName(CopyDirection copyDirection) {
-    if (copyDirection == COPY_DIRECTION_READ) return "read";
-    if (copyDirection == COPY_DIRECTION_WRITE) return "write";
-    throw std::runtime_error("Invalid copy direction");
-}
-
-CopyDirection getCopyDirection(std::string name) {
-    if (name == "read") return COPY_DIRECTION_READ;
-    if (name == "write") return COPY_DIRECTION_WRITE;
-    throw std::runtime_error("Invalid copy direction");
-}
-
-std::string getCopyTypeName(CopyType copyType) {
-    if (copyType == COPY_TYPE_CE) return "ce";
-    if (copyType == COPY_TYPE_SM) return "sm";
-    if (copyType == COPY_TYPE_MULTICAST_WRITE) return "mc";
-    if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) return "mc_ld_reduce";
-    if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_MULTICAST_RED_SINGLE) return "mc_red";
-    if (copyType == COPY_TYPE_LATENCY) return "latency";
-    if (copyType == COPY_TYPE_TMA) return "tma";
-    if (copyType == COPY_TYPE_TMA_MULTICAST_WRITE) return "tma_mc";
-    if (copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL) return "tma_mc_red_all";
-    if (copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) return "tma_mc_red_single";
-    throw std::runtime_error("Invalid copy type");
-}
-
-CopyType getCopyType(std::string name) {
-    if (name == "ce") return COPY_TYPE_CE;
-    if (name == "sm") return COPY_TYPE_SM;
-    if (name == "mc") return COPY_TYPE_MULTICAST_WRITE;
-    if (name == "mc_ld_reduce") return COPY_TYPE_MULTICAST_LD_REDUCE;
-    if (name == "mc_red") return COPY_TYPE_MULTICAST_RED_ALL;
-    if (name == "latency") return COPY_TYPE_LATENCY;
-    if (name == "tma") return COPY_TYPE_TMA;
-    if (name == "tma_mc") return COPY_TYPE_TMA_MULTICAST_WRITE;
-    if (name == "tma_mc_red_all") return COPY_TYPE_TMA_MULTICAST_RED_ALL;
-    if (name == "tma_mc_red_single") return COPY_TYPE_TMA_MULTICAST_RED_SINGLE;
-    throw std::runtime_error("Invalid copy type");
-}
-
 template <typename dstAllocator, typename srcAllocator, CopyDirection copyDirection, CopyType copyType>
 double doUnidir(int i, int j, size_t copySize) {
     std::shared_ptr<srcAllocator> src = std::make_shared<srcAllocator>(copySize, i);
@@ -199,72 +159,88 @@ public:
     }
 };
 
-void checkResultSymmetry(std::vector<double> &results) {
-    ASSERT(results.size() > 0);
-    auto max = *std::max_element(results.begin(), results.end());
-    auto min = *std::min_element(results.begin(), results.end());
-    ASSERT(max > 0);
-    if ((max - min) / max > 0.05) {
-        OUTPUT << "Individual copies have significant variation, the results may be unreliable" << std::endl;
-        OUTPUT << "Min: " << min << ", Max: " << max << std::endl;
+template <typename dstAllocator, typename srcAllocator, CopyType copyType>
+std::vector<Copy> generateAllToOneCopies(int targetDevice, size_t copySize) {
+    std::vector<Copy> copies;
+
+    for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
+        if (i == targetDevice) continue;
+        std::shared_ptr<dstAllocator> dstAlloc = std::make_shared<dstAllocator>(copySize, targetDevice);
+        std::shared_ptr<srcAllocator> srcAlloc = std::make_shared<srcAllocator>(copySize, i);
+        copies.push_back(Copy(dstAlloc, srcAlloc, COPY_DIRECTION_WRITE, copyType, iterations));
     }
+
+    return copies;
 }
 
 template <typename dstAllocator, typename srcAllocator, CopyType copyType>
+std::vector<Copy> generateAllFromOneCopies(int targetDevice, size_t copySize) {
+    std::vector<Copy> copies;
+    std::shared_ptr<srcAllocator> srcAlloc = std::make_shared<srcAllocator>(copySize, targetDevice);
+
+    for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
+        if (i == targetDevice) continue;
+        std::shared_ptr<dstAllocator> dstAlloc = std::make_shared<dstAllocator>(copySize, i);
+        copies.push_back(Copy(dstAlloc, srcAlloc, COPY_DIRECTION_READ, copyType, iterations));
+    }
+
+    return copies;
+}
+
+template <typename dstAllocator, typename srcAllocator, CopyType copyType, CopyDirection copyDirection>
+double doAllToOneGenericHelper(int targetDevice, size_t copySize) {
+    std::vector<Copy> copies;
+    if (copyDirection == COPY_DIRECTION_WRITE) {
+        copies = generateAllToOneCopies<dstAllocator, srcAllocator, copyType>(targetDevice, copySize);
+    } else {
+        copies = generateAllFromOneCopies<dstAllocator, srcAllocator, copyType>(targetDevice, copySize);
+    }
+    auto results = NvLoom::doBenchmark(copies);
+    return std::reduce(results.begin(), results.end());
+}
+
+template <typename dstAllocator, typename srcAllocator, CopyType copyType, CopyDirection copyDirection>
 class all_to_one_pattern : public TestcaseDstSrc<dstAllocator, srcAllocator, copyType> {
 public:
     void run(size_t copySize) {
         OutputMatrix output(getName(), 1, MPIWrapper::getWorldSize());
 
         for (int targetDevice = 0; targetDevice < MPIWrapper::getWorldSize(); targetDevice++) {
-            std::vector<Copy> copies;
-
-            for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
-                if (i == targetDevice) continue;
-                std::shared_ptr<dstAllocator> dstAlloc = std::make_shared<dstAllocator>(copySize, targetDevice);
-                std::shared_ptr<srcAllocator> srcAlloc = std::make_shared<srcAllocator>(copySize, i);
-                copies.push_back(Copy(dstAlloc, srcAlloc, COPY_DIRECTION_WRITE, copyType, iterations));
-            }
-
-            auto results = NvLoom::doBenchmark(copies);
-
-            checkResultSymmetry(results);
-
-            output.set(0, targetDevice, std::reduce(results.begin(), results.end()));
+            output.set(0, targetDevice, doAllToOneGenericHelper<dstAllocator, srcAllocator, copyType, copyDirection>(targetDevice, copySize));
         }
     }
 
-    std::string getName() {
-        return "all_to_one_" + srcAllocator::getName() + "_to_" + dstAllocator::getName() + "_" + getCopyDirectionName(COPY_DIRECTION_WRITE) + "_" + getCopyTypeName(copyType);
+    std::string getName() {\
+        std::string direction = (copyDirection == COPY_DIRECTION_WRITE) ? "to" : "from";
+        return "all_" + direction + "_one_" + srcAllocator::getName() + "_to_" + dstAllocator::getName() + "_" + getCopyDirectionName(copyDirection) + "_" + getCopyTypeName(copyType);
     }
 };
 
-template <typename dstAllocator, typename srcAllocator, CopyType copyType>
-class all_from_one_pattern : public TestcaseDstSrc<dstAllocator, srcAllocator, copyType> {
+template <typename dstAllocator, typename srcAllocator, CopyType copyType, CopyDirection copyDirection>
+class all_to_one_rack_aware : public TestcaseDstSrc<dstAllocator, srcAllocator, copyType> {
 public:
     void run(size_t copySize) {
-        OutputMatrix output(getName(), 1, MPIWrapper::getWorldSize());
+        OutputMatrix output(getName(), 1, NvLoom::getRackToProcessMap().size());
 
-        for (int targetDevice = 0; targetDevice < MPIWrapper::getWorldSize(); targetDevice++) {
-            std::vector<Copy> copies;
-            std::shared_ptr<srcAllocator> srcAlloc = std::make_shared<srcAllocator>(copySize, targetDevice);
+        std::vector<std::string> columnLabels;
 
-            for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
-                if (i == targetDevice) continue;
-                std::shared_ptr<dstAllocator> dstAlloc = std::make_shared<dstAllocator>(copySize, i);
-                copies.push_back(Copy(dstAlloc, srcAlloc, COPY_DIRECTION_READ, copyType, iterations));
-            }
+        for (auto const& elem : NvLoom::getRackToProcessMap()) {
+            columnLabels.push_back(elem.first);
+        }
 
-            auto results = NvLoom::doBenchmark(copies);
+        output.setLabelsY(columnLabels);
 
-            checkResultSymmetry(results);
-
-            output.set(0, targetDevice, std::reduce(results.begin(), results.end()));
+        int j = 0;
+        for (auto& elem : NvLoom::getRackToProcessMap()) {
+            int targetDevice = elem.second[0];
+            output.set(0, j, doAllToOneGenericHelper<dstAllocator, srcAllocator, copyType, copyDirection>(targetDevice, copySize));
+            j++;
         }
     }
 
     std::string getName() {
-        return "all_from_one_" + srcAllocator::getName()  + "_to_" + dstAllocator::getName() + "_" + getCopyDirectionName(COPY_DIRECTION_READ) + "_" + getCopyTypeName(copyType);
+        std::string direction = (copyDirection == COPY_DIRECTION_WRITE) ? "to" : "from";
+        return "rack_aware_all_" + direction + "_one_" + srcAllocator::getName() + "_to_" + dstAllocator::getName() + "_" + getCopyDirectionName(copyDirection) + "_" + getCopyTypeName(copyType);
     }
 };
 
@@ -602,7 +578,7 @@ template <typename allocator>
 class latency : public Testcase {
 public:
     void run(size_t copySize) {
-        OutputMatrix output(getName(), MPIWrapper::getWorldSize(), MPIWrapper::getWorldSize(), BUFFERING_ENABLED, "ns");
+        OutputMatrix output(getName(), MPIWrapper::getWorldSize(), MPIWrapper::getWorldSize(), BUFFERING_ENABLED, OutputMatrix::MeasurementType::LATENCY);
 
         for (int shift = 1; shift < MPIWrapper::getWorldSize(); shift++) {
             std::vector<Copy> latencies;
@@ -639,6 +615,8 @@ static void addTestcase(
         suites[suiteName].push_back(testcase->getName());
     }
 
+    ASSERT(testcases.count(testcase->getName()) == 0);
+
     testcases[testcase->getName()] = std::move(testcase);
 }
 
@@ -671,10 +649,16 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM> >());
 
     // all-to-one
-    addTestcase(suites, "all-to-one", testcases, std::make_unique<all_to_one_pattern<unicastAllocator, unicastAllocator, COPY_TYPE_CE> >());
-    addTestcase(suites, "all-to-one", testcases, std::make_unique<all_from_one_pattern<unicastAllocator, unicastAllocator, COPY_TYPE_CE> >());
-    addTestcase(suites, "all-to-one", testcases, std::make_unique<all_to_one_pattern<unicastAllocator, unicastAllocator, COPY_TYPE_SM> >());
-    addTestcase(suites, "all-to-one", testcases, std::make_unique<all_from_one_pattern<unicastAllocator, unicastAllocator, COPY_TYPE_SM> >());
+    addTestcase(suites, "all-to-one", testcases, std::make_unique<all_to_one_pattern<unicastAllocator, unicastAllocator, COPY_TYPE_CE, COPY_DIRECTION_WRITE> >());
+    addTestcase(suites, "all-to-one", testcases, std::make_unique<all_to_one_pattern<unicastAllocator, unicastAllocator, COPY_TYPE_CE, COPY_DIRECTION_READ> >());
+    addTestcase(suites, "all-to-one", testcases, std::make_unique<all_to_one_pattern<unicastAllocator, unicastAllocator, COPY_TYPE_SM, COPY_DIRECTION_WRITE> >());
+    addTestcase(suites, "all-to-one", testcases, std::make_unique<all_to_one_pattern<unicastAllocator, unicastAllocator, COPY_TYPE_SM, COPY_DIRECTION_READ> >());
+
+    // all-to-one rack-aware
+    addTestcase(suites, "rack-aware-all-to-one", testcases, std::make_unique<all_to_one_rack_aware<unicastAllocator, unicastAllocator, COPY_TYPE_CE, COPY_DIRECTION_WRITE> >());
+    addTestcase(suites, "rack-aware-all-to-one", testcases, std::make_unique<all_to_one_rack_aware<unicastAllocator, unicastAllocator, COPY_TYPE_CE, COPY_DIRECTION_READ> >());
+    addTestcase(suites, "rack-aware-all-to-one", testcases, std::make_unique<all_to_one_rack_aware<unicastAllocator, unicastAllocator, COPY_TYPE_SM, COPY_DIRECTION_WRITE> >());
+    addTestcase(suites, "rack-aware-all-to-one", testcases, std::make_unique<all_to_one_rack_aware<unicastAllocator, unicastAllocator, COPY_TYPE_SM, COPY_DIRECTION_READ> >());
 
     // multicast
     addTestcase(suites, "multicast", testcases, std::make_unique<multicast_one_to_all<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_MULTICAST_WRITE, COPY_DIRECTION_WRITE> >());
@@ -718,6 +702,17 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_SM, COPY_COUNT_BIDIR> >());
     addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM, COPY_COUNT_BIDIR> >());
 
+    // egm-gpu-to-rack
+    addTestcase(suites, "egm-gpu-to-rack", testcases, std::make_unique<gpu_to_rack<unicastAllocator, egmAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE, COPY_COUNT_UNIDIR> >());
+    addTestcase(suites, "egm-gpu-to-rack", testcases, std::make_unique<gpu_to_rack<unicastAllocator, egmAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE, COPY_COUNT_UNIDIR> >());
+    addTestcase(suites, "egm-gpu-to-rack", testcases, std::make_unique<gpu_to_rack<unicastAllocator, egmAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_SM, COPY_COUNT_UNIDIR> >());
+    addTestcase(suites, "egm-gpu-to-rack", testcases, std::make_unique<gpu_to_rack<unicastAllocator, egmAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM, COPY_COUNT_UNIDIR> >());
+
+    addTestcase(suites, "egm-gpu-to-rack", testcases, std::make_unique<gpu_to_rack<egmAllocator, egmAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE, COPY_COUNT_UNIDIR> >());
+    addTestcase(suites, "egm-gpu-to-rack", testcases, std::make_unique<gpu_to_rack<egmAllocator, egmAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE, COPY_COUNT_UNIDIR> >());
+    addTestcase(suites, "egm-gpu-to-rack", testcases, std::make_unique<gpu_to_rack<egmAllocator, egmAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_SM, COPY_COUNT_UNIDIR> >());
+    addTestcase(suites, "egm-gpu-to-rack", testcases, std::make_unique<gpu_to_rack<egmAllocator, egmAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM, COPY_COUNT_UNIDIR> >());
+
     // rack-to-rack fabric saturation
     addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_unidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE> >());
     addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_unidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE> >());
@@ -751,7 +746,7 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     } else if (strategy == ALLOCATOR_STRATEGY_CUDA_POOLS) {
         return buildTestcasesLower< MultinodeMemoryPoolAllocationUnicast,
                                     MultinodeMemoryPoolAllocationEGM,
-                                    MultinodeMemoryAllocationMulticast>();
+                                    MultinodeMemoryAllocationMulticastCudaPool>();
     }
     ASSERT(0);
 }

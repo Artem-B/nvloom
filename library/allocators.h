@@ -23,6 +23,18 @@
 #include "enums.h"
 #include "nvloom.h"
 
+// Once created, the pools live until the end of the program
+// CUDA driver maintains the allocations in pools, so there's no need to destroy them
+// Allocations should get reused between testcases
+class Pools {
+public:
+    static inline std::map<CUmemLocationType, std::vector<CUmemoryPool> > pools = {
+        {CU_MEM_LOCATION_TYPE_DEVICE, {}},
+        {CU_MEM_LOCATION_TYPE_HOST_NUMA, {}}
+    };
+    static void initPools(CUmemLocationType location);
+};
+
 class MemoryAllocation {
 public:
     void *ptr = nullptr;
@@ -143,28 +155,30 @@ private:
     CUmulticastObjectProp multicastProp = {};
     CUmemAccessDesc desc = {};
     size_t roundedUpAllocationSize;
+    bool useCudaPool = false;
 
+    void createMulticastGroup();
+    void allocateMemory();
+    void allocateMemoryCudaPool();
+    void releaseMemory();
+    void releaseMemoryCudaPool();
+    void mapMemory();
 public:
-    MultinodeMemoryAllocationMulticast(size_t _allocationSize, int _MPIrank);
+    MultinodeMemoryAllocationMulticast(size_t _allocationSize, int _MPIrank, bool useCudaPool = false);
     ~MultinodeMemoryAllocationMulticast();
+};
+
+class MultinodeMemoryAllocationMulticastCudaPool : public MultinodeMemoryAllocationMulticast {
+public:
+    MultinodeMemoryAllocationMulticastCudaPool(size_t _allocationSize, int _MPIrank) : MultinodeMemoryAllocationMulticast(_allocationSize, _MPIrank, true) {};
+    ~MultinodeMemoryAllocationMulticastCudaPool() {};
 };
 
 class MultinodeMemoryPoolAllocationBase : public MemoryAllocation {
 private:
-    static inline bool devicePoolsInitialized;
-    static inline bool egmPoolsInitialized;
-    static inline std::vector<CUmemoryPool> device_pools;
-    static inline std::vector<CUmemoryPool> egm_pools;
-    std::vector<CUmemFabricHandle> fh_vector;
-    CUmemLocationType mem_location;
-    CUmemPoolProps poolProps = { };
-    CUmemAllocationHandleType handleType = {};
-    CUmemPoolPtrExportData data;
-    CUmemAccessDesc desc = {};
 public:
     MultinodeMemoryPoolAllocationBase(size_t _allocationSize, int _MPIrank, CUmemLocationType location);
     virtual ~MultinodeMemoryPoolAllocationBase();
-    virtual std::vector<CUmemoryPool> initPoolsLazy();
 };
 
 class MultinodeMemoryPoolAllocationUnicast : public MultinodeMemoryPoolAllocationBase {
