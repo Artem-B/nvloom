@@ -71,34 +71,32 @@ __global__ void stridingMemcpyKernel(unsigned int totalThreadCount, unsigned lon
     size_t globalThreadId = blockDim.x * blockIdx.x + threadIdx.x;
     dst += globalThreadId;
     src += globalThreadId;
+    size_t maxElementIndex = sizeInElement - globalThreadId;
 
     // Calculate where to end the big pipelined copy
     size_t bigChunkSizeInElement = chunkSizeInElement / UNROLL_FACTOR;
-    T *dstBigEnd = dst + (bigChunkSizeInElement * UNROLL_FACTOR) * totalThreadCount;
-
     for (unsigned int i = 0; i < loopCount; i++) {
-        T* cdst = dst;
-        T* csrc = src;
+        for (unsigned long long j = 0; j < bigChunkSizeInElement; j++) {
+            unsigned long long offset = j * UNROLL_FACTOR * totalThreadCount;
 
-        while (cdst < dstBigEnd) {
             T pipe[UNROLL_FACTOR];
             #pragma unroll
             for (int k = 0; k < UNROLL_FACTOR; ++k) {
-                pipe[k] = *csrc; csrc += totalThreadCount;
+                pipe[k] = src[offset + k * totalThreadCount];
             }
             #pragma unroll
             for (int k = 0; k < UNROLL_FACTOR; ++k) {
-                write(cdst, pipe[k]); cdst += totalThreadCount;
+                write(dst + offset + k * totalThreadCount, pipe[k]);
             }
         }
 
-        // Take care of copies that didn't get aligned properly
-        for (size_t j = bigChunkSizeInElement * UNROLL_FACTOR; j < chunkSizeInElement; ++j) {
-            write(dst + j * totalThreadCount, src[j * totalThreadCount]);
+        // Take care of copies that didn't get aligned properly and remainder elements
+        size_t start_offset = bigChunkSizeInElement * UNROLL_FACTOR * totalThreadCount;
+        for (size_t offset = start_offset; offset < maxElementIndex; offset += totalThreadCount) {
+            write(dst + offset, src[offset]);
         }
     }
 }
-
 
 template<typename T, reduce_from_memory<T> write>
 __global__ void simpleMemcpyKernel(unsigned int totalThreadCount, unsigned long long loopCount, T* dst, T* src, size_t sizeInElement) {
